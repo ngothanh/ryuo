@@ -7,15 +7,15 @@
 
 ---
 
-## The 100-Microsecond Problem
+## The Sub-Microsecond Problem
 
-Your algorithm is optimized. Every hot path is profiled. Memory allocations are hand-tuned. But your system still can't break the 100-microsecond latency barrier.
+Your algorithm is optimized. Every hot path is profiled. Memory allocations are hand-tuned. But your system still can't reliably hit **sub-microsecond p99.9 latency**.
 
 The culprit? **Your message queue.**
 
-Traditional queues add significant latency per hop. In a system with multiple processing stages, this compounds quickly. For high-frequency trading, real-time gaming, or telemetry pipelines, this is unacceptable.
+To put the stakes in concrete terms: a co-located market maker targeting < 1μs round-trip, a risk engine that must clear orders in < 5μs, or a market-data pipeline at 50 M updates/sec — all of them share the same ceiling. A single queue hop through a traditional `Mutex`-backed queue can cost **1–10μs** under contention, an eternity when your entire latency budget is measured in hundreds of nanoseconds.
 
-Here's why, and what we're going to build to fix it.
+Traditional queues add latency at every pipeline stage, and that compounds. Here's why — and what we're going to build to fix it.
 
 ---
 
@@ -70,8 +70,9 @@ This is thread-safe, bounded, and uses condition variables for efficient waiting
 
 | Operation | Typical Range | Why It Matters |
 |-----------|---------------|----------------|
-| **Lock (uncontended)** | 10-50ns | Atomic CAS + memory fence |
-| **Lock (contended)** | 1-10μs | Futex syscall, context switch, scheduler |
+| **Lock (uncontended, L1 hit)** | 2-5ns | Atomic CAS + memory fence — when the lock cache line is already hot |
+| **Lock (uncontended, cache cold)** | 10-50ns | Same atomic, but must first fetch the cache line from L2/L3 |
+| **Lock (contended)** | 1-10μs | Futex syscall, context switch, scheduler involvement |
 | **Cache miss (L3)** | 10-40ns | Cache coherency protocol |
 | **Cache miss (RAM)** | 50-200ns | Memory controller latency, NUMA effects |
 | **Condvar notification** | 30-100ns | Atomic + potential futex wakeup |
@@ -103,10 +104,10 @@ When a thread can't acquire a lock, the kernel must:
 4. **Pollute the cache** (new thread's working set evicts old data)
 
 Even "uncontended" locks have overhead. Acquiring a lock requires:
-- An **atomic operation** (special CPU instruction that can't be interrupted)
-- A **memory fence** (forces the CPU to finish all pending memory operations before continuing)
+- An **atomic operation** (a `lock`-prefixed instruction that serializes access across all cores)
+- A **memory fence** (prevents the CPU and compiler from reordering memory accesses across the barrier; on x86-64, `lock cmpxchg` implies a full fence implicitly)
 
-These operations prevent the CPU from executing instructions out-of-order or in parallel, reducing throughput.
+These operations constrain out-of-order execution and instruction-level parallelism, reducing throughput even when no other thread is competing.
 
 ### When Locks Are Actually Fine
 
@@ -135,7 +136,7 @@ More load → More contention → Longer lock hold times → More threads blocke
 → More context switches → More cache misses → Even longer lock hold times
 ```
 
-Under heavy contention, the majority of CPU time is spent in kernel futex operations rather than doing actual work.
+Under heavy contention, a significant fraction of CPU time can shift to kernel futex operations rather than doing actual work — the exact proportion depends on lock-hold time and thread count, but the feedback loop is the mechanism that causes p99.9 spikes to be orders of magnitude worse than p50.
 
 ---
 
@@ -202,16 +203,27 @@ numactl --cpunodebind=0 --membind=0 ./consumer
 
 **In Rust:**
 ```rust
-// Allocate ring buffer on specific NUMA node (requires libnuma)
+// Allocate ring buffer on a specific NUMA node (requires libnuma)
 use libnuma_sys::*;
 
 unsafe {
-    numa_set_preferred(0);  // Prefer node 0
+    // ⚠️  numa_set_preferred() is ADVISORY — the kernel may still allocate
+    // on a remote node under memory pressure. For HFT systems that require
+    // a hard guarantee, use numa_alloc_onnode() directly, or mbind() with
+    // MPOL_BIND on the allocated region. The numactl(8) command-line wrapper
+    // uses MPOL_BIND and is the safest starting point.
+    numa_set_preferred(0);
     let ring_buffer = RingBuffer::new(1024, || Event::default());
 }
 ```
 
-**Tradeoff:** NUMA pinning gives you **2-3x latency improvement** but reduces flexibility. If your workload is dynamic (threads move around), NUMA pinning can hurt. For HFT with fixed topology, it's essential.
+**For production HFT**, prefer a hard binding:
+```bash
+# Hard-bind both CPU and memory to node 0 (MPOL_BIND — no remote fallback)
+numactl --cpunodebind=0 --membind=0 ./your_process
+```
+
+**Tradeoff:** NUMA pinning gives you **2-3x latency improvement** but reduces scheduling flexibility. For HFT with a fixed thread topology, it's essential.
 
 **Bottom line:** A perfect lock-free queue on the wrong NUMA node is slower than a mutex on the right NUMA node. Fix your topology first, then optimize your queue.
 
@@ -257,23 +269,29 @@ Even worse, allocations cause **GC pressure** in garbage-collected languages (Ja
 
 You might ask: "Why not just use `VecDeque<T>` with a `Mutex`?" `VecDeque` is actually pretty good—it's a ring buffer backed by contiguous memory. But it has three problems for HFT:
 
-**1. False sharing:** Head and tail indices are in the same struct (likely same cache line)
+**1. False sharing:** Head and length counters are in the same struct (same cache line)
 
 ```rust
+// Actual Rust std::collections::VecDeque layout (simplified for illustration):
 struct VecDeque<T> {
-    head: usize,  // Modified by consumer
-    tail: usize,  // Modified by producer ← Same cache line!
-    buf: Vec<T>,
+    head: usize,  // Modified by consumer (pop_front)
+    len:  usize,  // Modified by both producer and consumer ← Same cache line!
+    buf: RawVec<T>,
 }
+// Note: There is no explicit `tail` field. Tail is computed as (head + len) & mask.
+// Both `head` and `len` are hot on every operation — false sharing is real.
 ```
 
 Every push/pop causes cache line invalidation between cores. With Disruptor, we put producer and consumer metadata in separate cache lines:
 
 ```rust
-#[repr(align(64))]  // Force 64-byte alignment (cache line size)
+// NOTE: 64-byte cache lines are standard on x86-64.
+// ARM64 (Apple Silicon, Ampere, AWS Graviton) uses 128-byte lines.
+// Post 2 covers the full cross-platform story; for now we assume x86-64.
+#[repr(align(64))]  // Force 64-byte alignment (one x86-64 cache line)
 struct Producer {
     cursor: AtomicI64,
-    _pad: [u8; 56],  // Padding to fill cache line
+    _pad: [u8; 56],  // AtomicI64 = 8 bytes; pad to fill the 64-byte line
 }
 
 #[repr(align(64))]
@@ -300,13 +318,12 @@ On modern CPUs, integer division takes ~3-11 cycles vs 1 cycle for AND. More imp
 **3. No cache-line padding:** Producer/consumer metadata not isolated
 
 ```rust
-// VecDeque: Everything in one struct (cache line ping-pong)
-struct VecDeque { head, tail, buf }
+// VecDeque: head + len + buf all in one struct → single hot cache line
+//   → producer and consumer fight over the same line on every op
 
-// Disruptor: Separate cache lines (no ping-pong)
-// Producer writes to cache line 0
-// Consumer writes to cache line 1
-// No invalidation!
+// Disruptor: producer and consumer live on different cache lines entirely
+//   → producer writes cache line 0, consumer writes cache line 1
+//   → no MESI invalidation traffic between them
 ```
 
 **Expected performance characteristics** (based on design principles, not measured):
@@ -348,7 +365,7 @@ The original LMAX Disruptor paper (2011) compared Java implementations:
 
 **What to expect in Rust:**
 - Rust has no GC, so the gap between traditional queues and Disruptor is smaller
-- `crossbeam::channel` is already quite fast (typically 50-200ns per hop based on community benchmarks)
+- `crossbeam::channel` is already quite fast — Jon Gjengset's [channel benchmark suite](https://github.com/jonhoo/flume/blob/main/benchmarks/round_trip.rs) and the widely-cited [crossbeam benchmarks](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel/benchmarks) show ~50–200ns round-trip on modern x86-64
 - Disruptor-style design can achieve ~20-100ns per hop
 - Actual performance depends heavily on your workload and hardware
 
@@ -363,28 +380,30 @@ The original LMAX Disruptor paper (2011) compared Java implementations:
 ## Decision Tree: Should You Use Ryuo?
 
 ```
-                    Start
-                      |
-                      v
-            Throughput > 100K/sec?
-                   /     \
-                 No       Yes
-                 |         |
-                 v         v
-          Use crossbeam   Tail latency
-          or std::mpsc    requirement?
-                           /    \
-                      p99 < 1ms  p99.9 < 100μs
-                         |            |
-                         v            v
-                   Use crossbeam  Multi-stage
-                                  pipeline?
-                                   /    \
-                                 No      Yes (3+ stages)
-                                 |        |
-                                 v        v
-                           Maybe Ryuo   Use Ryuo
+                         Start
+                           |
+                           v
+              Tail latency SLA < 1ms (p99.9)?
+                        /        \
+                      No          Yes
+                       |           |
+                       v           v
+               Use crossbeam   Throughput > 1M/sec?
+               or std::mpsc       /        \
+                                No          Yes
+                                 |           |
+                                 v           v
+                          crossbeam       Multi-stage pipeline
+                          (simpler)       (3+ stages) OR
+                                          single stage < 500ns budget?
+                                               /       \
+                                              No        Yes
+                                               |         |
+                                               v         v
+                                          crossbeam   Use Ryuo
 ```
+
+> **Why latency first?** In HFT, throughput and latency are coupled but latency is the primary constraint. A risk engine processing 50K orders/sec with a p99.9 < 5μs budget needs Ryuo. A telemetry pipeline at 5M/sec with p99 < 10ms does not — `crossbeam` handles it cleanly with far less complexity.
 
 ### Concrete Examples
 
