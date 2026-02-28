@@ -70,12 +70,13 @@ This is thread-safe, bounded, and uses condition variables for efficient waiting
 
 | Operation | Typical Range | Why It Matters |
 |-----------|---------------|----------------|
-| **Lock (uncontended, L1 hit)** | 2-5ns | Atomic CAS + memory fence — when the lock cache line is already hot |
-| **Lock (uncontended, cache cold)** | 10-50ns | Same atomic, but must first fetch the cache line from L2/L3 |
+| **Lock (uncontended, L1 hit)** | 20-50ns | Full `pthread_mutex_lock` path: function call + `cmpxchg` + Acquire barrier. The raw `cmpxchg` instruction alone is ~1-3ns, but `Mutex::lock()` is not just the instruction. |
+| **Lock (uncontended, cache cold)** | 50-150ns | Same lock path, but must first fetch the lock's cache line from L2/L3 before the CAS |
 | **Lock (contended)** | 1-10μs | Futex syscall, context switch, scheduler involvement |
 | **Cache miss (L3)** | 10-40ns | Cache coherency protocol |
 | **Cache miss (RAM)** | 50-200ns | Memory controller latency, NUMA effects |
-| **Condvar notification** | 30-100ns | Atomic + potential futex wakeup |
+| **Condvar notification (no waiter)** | 5-30ns | Just an atomic write to the futex word — no syscall needed |
+| **Condvar notification (thread waiting)** | 200-500ns | Must call `futex(FUTEX_WAKE)` to unpark the sleeping thread. In the queue scenario, the consumer IS waiting, so this is the path taken. |
 | **Context switch** | 1-10μs | Kernel scheduler, TLB flush |
 
 **Sources:**
@@ -238,11 +239,11 @@ queue.push_back(item);  // Might call malloc() internally
 ```
 
 Memory allocation is **expensive**:
-- **Best case** (allocator's per-thread cache has free memory): ~50ns (200 cycles)
+- **Best case** (allocator's per-thread cache has free memory): ~10-30ns — jemalloc and mimalloc tcache fast paths benchmark in this range on modern x86-64
 - **Typical case** (must acquire lock on global allocator): ~100-200ns (400-800 cycles)
 - **Worst case** (must ask OS for more memory via system call): ~1-10μs (4,000-40,000 cycles)
 
-Modern allocators (like jemalloc or mimalloc) maintain small caches of free memory per thread to avoid locking. But even the fast path adds 50ns.
+Modern allocators (like jemalloc or mimalloc) maintain small caches of free memory per thread to avoid locking. But even the fast path adds tens of nanoseconds.
 
 Even worse, allocations cause **GC pressure** in garbage-collected languages (Java, Go). The LMAX team found that GC pauses were their #1 latency killer, which is why they invented the Disruptor pattern.
 
@@ -259,11 +260,13 @@ Even worse, allocations cause **GC pressure** in garbage-collected languages (Ja
 3. **Cache-friendly**: Sequential access, cache-line padding
 4. **Mechanical sympathy**: Designed with CPU architecture in mind
 
-### Target Performance
+### Design Targets (Not Yet Measured)
 
-- **Latency**: 50-200ns mean (p99 < 1μs)
-- **Throughput**: 10M+ messages/sec per core
-- **Scalability**: Linear scaling with cores (no contention)
+These are the goals the design is optimized toward. Actual numbers will be measured in Post 15 using rigorous methodology (HdrHistogram, coordinated omission correction, multiple hardware configurations). They are derived from the original LMAX Java Disruptor's published results on 2011 hardware — a Rust implementation on modern hardware may differ.
+
+- **Latency**: targeting 50-200ns mean (p99 < 1μs) — based on LMAX paper baseline; Rust has no GC, which removes the main noise source
+- **Throughput**: targeting 10M+ messages/sec per core — based on LMAX's published 25M ops/sec single-producer result
+- **Scalability**: designed for linear scaling (no shared lock in the hot path), but CAS contention with multiple producers degrades this
 
 ### Why VecDeque Isn't Fast Enough
 
@@ -311,9 +314,9 @@ let index = self.head % self.capacity;
 let index = self.head & self.mask;  // Only works if capacity is power-of-2
 ```
 
-On modern CPUs, integer division takes ~3-11 cycles vs 1 cycle for AND. More importantly, division has lower throughput (1 per 3-6 cycles) vs AND (3-4 per cycle), limiting instruction-level parallelism.
+On modern x86-64, a 64-bit `DIV` instruction has a latency of **35–90 cycles** (varies by µarch: ~36 cycles on Skylake, ~35-88 cycles on Zen 3) and a throughput of roughly one per 21–74 cycles. A 64-bit `AND` has a latency of **1 cycle** and can execute 3–4 per cycle. The difference is not "3-11 cycles" — it is an order of magnitude or more.
 
-**Source:** Intel optimization manual, Agner Fog's instruction tables
+**Source:** Agner Fog, *Instruction tables*, 2024 — tables for Skylake, Zen3, and Golden Cove; Intel 64 and IA-32 Architectures Optimization Reference Manual, §3.5.1
 
 **3. No cache-line padding:** Producer/consumer metadata not isolated
 
@@ -365,7 +368,7 @@ The original LMAX Disruptor paper (2011) compared Java implementations:
 
 **What to expect in Rust:**
 - Rust has no GC, so the gap between traditional queues and Disruptor is smaller
-- `crossbeam::channel` is already quite fast — Jon Gjengset's [channel benchmark suite](https://github.com/jonhoo/flume/blob/main/benchmarks/round_trip.rs) and the widely-cited [crossbeam benchmarks](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel/benchmarks) show ~50–200ns round-trip on modern x86-64
+- `crossbeam::channel` is already quite fast
 - Disruptor-style design can achieve ~20-100ns per hop
 - Actual performance depends heavily on your workload and hardware
 
@@ -475,7 +478,7 @@ fn process<H: EventHandler>(handler: &H, event: &Event) {
 
 This means **zero runtime overhead**—the CPU knows exactly which function to call.
 
-Java's generics use **type erasure** and **virtual dispatch** (looking up the function address in a vtable at runtime), adding 5-10ns per call.
+Java's generics use **type erasure** and **virtual dispatch** (looking up the function address in a vtable at runtime). With a warm branch predictor and a JIT-compiled monomorphic call site, this is **~2-5ns** per call. Cold or megamorphic call sites — where the JIT cannot predict the target — run at **10-20ns**. Steady-state HFT hot paths are typically in the 2-5ns range, but cannot be eliminated by the JVM the way Rust eliminates them at compile time.
 
 ### 3. **Fearless Concurrency**
 
@@ -510,15 +513,17 @@ Let's be clear about what this series does **not** cover:
 
 Your queue is 50ns. Your network is 500ns-5μs. Optimizing the queue is pointless if you're not using kernel bypass (DPDK, Solarflare, Mellanox).
 
-**Typical HFT latency breakdown** (example with 10μs network):
+**Illustrative HFT latency breakdown** (these are rough proportional estimates to show where time goes — not measured numbers from Ryuo):
 ```
-Network (kernel stack):     10μs      ← 96% of total
-Event handler:              300ns     ← 3% of total
-Queue (Disruptor):          50ns      ← 0.5% of total
-Total:                      10.35μs
+Network (kernel stack):     ~10μs     ← well-documented; kernel UDP stack on a stock NIC
+Event handler:              varies    ← depends entirely on your logic; often 100ns–2μs
+Queue (Disruptor):          ~50-200ns ← LMAX published range; Ryuo targets this once built
+Total:                      ~10.2-12μs (at this example network latency)
 ```
 
-**Bottom line:** Fix your network first. Optimizing a 50ns queue when your network adds 10μs (200x more) has minimal impact on end-to-end latency.
+The exact handler and queue numbers will be measured in Post 15. The point — that kernel-stack networking dominates the budget — holds for any realistic handler.
+
+**Bottom line:** Fix your network first. Optimizing a queue when your NIC adds 10μs (100-200× more than the queue) has minimal impact on end-to-end latency.
 
 ### 2. **CPU Pinning & Isolation**
 
@@ -540,7 +545,7 @@ cpupower frequency-set -g performance
 
 ### 3. **Clock Synchronization**
 
-How do you measure latency? `Instant::now()` uses CLOCK_MONOTONIC, which has ~20-50ns resolution. For sub-100ns latency, you need TSC (Time Stamp Counter):
+How do you measure latency? `Instant::now()` uses `CLOCK_MONOTONIC` via the Linux VDSO. The clock's **resolution** is 1ns (backed by TSC on modern hardware), but the **call overhead** — the time spent executing `Instant::now()` — is ~15-30ns. That overhead is larger than the ring buffer's own p50 latency, so for sub-100ns benchmarks you need TSC directly:
 
 ```rust
 #[inline(always)]
