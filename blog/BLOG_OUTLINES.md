@@ -20,7 +20,7 @@ All remaining blocking and significant issues have been resolved:
 
 3. ✅ **Post 3 - `SingleProducerSequencer` Thread-Ownership Guard**: Added `#[cfg(debug_assertions)] producer_thread: ThreadId` field and a `debug_assert_eq!` in `claim()` / `try_claim()`. Misuse (calling claim from a second thread) is caught at development time, not silently in production.
 
-4. ✅ **Post 5 - `BlockingWaitStrategy` Race Condition Fixed**: The previous implementation checked the availability condition *outside* the mutex, then called `condvar.wait()`. A signal arriving between the check and the wait was silently dropped, causing a permanent deadlock. The fix: re-check condition *under the lock* in a loop, and lock the mutex inside `signal_all_when_blocking()` before calling `notify_all()`.
+4. ✅ **Post 4 - `BlockingWaitStrategy` Race Condition Fixed**: The previous implementation checked the availability condition *outside* the mutex, then called `condvar.wait()`. A signal arriving between the check and the wait was silently dropped, causing a permanent deadlock. The fix: re-check condition *under the lock* in a loop, and lock the mutex inside `signal_all_when_blocking()` before calling `notify_all()`.
 
 5. ✅ **Post 6 - Async Use-After-Move Bug Fixed**: `AsyncIOHandler::process()` called `flush_to_disk(writes).await` (consuming `writes`), then accessed `writes.last()` — a use-after-move compile error. Fixed by capturing `last_seq` before the move.
 
@@ -640,144 +640,267 @@ mod tests {
 - ❌ Publishing out of order (multi-producer) → Handled by available_buffer
 - ❌ Using wrong memory ordering → Causes data races
 
-**What's Next:** Post 4 covers sequence barriers—how consumers coordinate.
+**What's Next:** Post 4 covers wait strategies—trading latency for CPU.
 
 ---
 
-## Post 4 — Sequence Barriers: Coordinating Dependencies
+## Post 4 — Wait Strategies: Trading Latency for CPU
 
 **The Problem:**
-- How do consumers know when events are available?
-- How do we prevent ring buffer wrap-around?
-- How do we build dependency graphs (handler A must run before B)?
+- Busy-spin: lowest latency (~50ns), 100% CPU usage
+- Blocking: CPU-friendly (0% idle), higher latency (~10μs)
+- Need configurable trade-offs for different workloads
 
 **The Solution:**
-- `SequenceBarrier`: Tracks cursor + dependent sequences
-- `wait_for(sequence)`: Blocks until sequence is published
-- Returns highest available sequence (enables batching)
-- Dependency tracking prevents overwrites
+- `BusySpinWaitStrategy`: Tight loop (lowest latency)
+- `YieldingWaitStrategy`: Yield after spinning
+- `SleepingWaitStrategy`: Progressive backoff
+- `BlockingWaitStrategy`: Condition variable (highest latency)
+- `TimeoutBlockingWaitStrategy`: With timeout support
+- `PhasedBackoffWaitStrategy`: Hybrid approach
 
 **Implementation in Rust:**
 ```rust
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-pub struct SequenceBarrier {
-    cursor: Arc<AtomicI64>,
-    dependent_sequences: Vec<Arc<AtomicI64>>,
-    wait_strategy: Box<dyn WaitStrategy>,
-    alerted: AtomicBool,
+pub trait WaitStrategy: Send + Sync {
+    fn wait_for(
+        &self,
+        sequence: i64,
+        cursor: &AtomicI64,
+        dependent_sequences: &[Arc<AtomicI64>],
+        barrier: &SequenceBarrier,
+    ) -> Result<i64, BarrierError>;
+
+    fn signal_all_when_blocking(&self);
 }
 
-impl SequenceBarrier {
-    pub fn wait_for(&self, sequence: i64) -> Result<i64, BarrierError> {
-        self.check_alert()?;
-        
+/// Lowest latency, highest CPU usage
+pub struct BusySpinWaitStrategy;
+
+impl WaitStrategy for BusySpinWaitStrategy {
+    fn wait_for(&self, sequence: i64, cursor: &AtomicI64,
+                dependent_sequences: &[Arc<AtomicI64>],
+                barrier: &SequenceBarrier) -> Result<i64, BarrierError> {
         loop {
-            let available = self.get_available_sequence();
+            barrier.check_alert()?;
+
+            let available = get_minimum_sequence(cursor, dependent_sequences);
             if available >= sequence {
                 return Ok(available);
             }
-            
-            // Delegate to wait strategy
-            self.wait_strategy.wait_for(
-                sequence,
-                &self.cursor,
-                self.dependent_sequences.as_slice(),
-                self
-            )?;
-            
-            // Handle spurious wakeups
-            self.check_alert()?;
+
+            // x86: Use PAUSE instruction to reduce power and improve performance
+            std::hint::spin_loop();
         }
     }
-    
-    fn get_available_sequence(&self) -> i64 {
-        let mut minimum = self.cursor.load(Ordering::Acquire);
-        
-        for seq in &self.dependent_sequences {
-            let value = seq.load(Ordering::Acquire);
-            minimum = minimum.min(value);
-        }
-        
-        minimum
-    }
-    
-    pub fn alert(&self) {
-        self.alerted.store(true, Ordering::Release);
-        self.wait_strategy.signal_all_when_blocking();
-    }
-    
-    pub fn check_alert(&self) -> Result<(), BarrierError> {
-        if self.alerted.load(Ordering::Acquire) {
-            Err(BarrierError::Alerted)
-        } else {
-            Ok(())
-        }
-    }
-    
-    pub fn clear_alert(&self) {
-        self.alerted.store(false, Ordering::Release);
+
+    fn signal_all_when_blocking(&self) {
+        // No-op for busy spin
     }
 }
 
-#[derive(Debug)]
-pub enum BarrierError {
-    Alerted,
-    Timeout,
-    Interrupted,
+/// Yields after spinning, lower CPU usage
+pub struct YieldingWaitStrategy {
+    spin_tries: u32,
 }
-```
 
-**Dependency Graph Example:**
-```rust
-// Diamond topology: P -> [H1, H2] -> H3
-//
-//     Producer
-//        |
-//    +---+---+
-//    |       |
-//   H1      H2
-//    |       |
-//    +---+---+
-//        |
-//       H3
+impl WaitStrategy for YieldingWaitStrategy {
+    fn wait_for(&self, sequence: i64, cursor: &AtomicI64,
+                dependent_sequences: &[Arc<AtomicI64>],
+                barrier: &SequenceBarrier) -> Result<i64, BarrierError> {
+        let mut counter = self.spin_tries;
 
-let barrier_h1 = ring_buffer.new_barrier(&[]); // Depends on producer only
-let barrier_h2 = ring_buffer.new_barrier(&[]); // Depends on producer only
-let barrier_h3 = ring_buffer.new_barrier(&[h1_sequence, h2_sequence]); // Waits for both
-```
+        loop {
+            barrier.check_alert()?;
 
-**Spurious Wakeup Handling:**
-```rust
-// Always loop and re-check condition
-loop {
-    let available = self.get_available_sequence();
-    if available >= sequence {
-        return Ok(available); // Condition met
+            let available = get_minimum_sequence(cursor, dependent_sequences);
+            if available >= sequence {
+                return Ok(available);
+            }
+
+            if counter > 0 {
+                counter -= 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now(); // Give up CPU
+                counter = self.spin_tries;
+            }
+        }
     }
-    
-    self.wait_strategy.wait()?; // May wake spuriously
-    // Loop back and re-check
+
+    fn signal_all_when_blocking(&self) {}
+}
+
+/// Progressive backoff: spin -> yield -> sleep
+pub struct SleepingWaitStrategy {
+    retries: u32,
+}
+
+impl WaitStrategy for SleepingWaitStrategy {
+    fn wait_for(&self, sequence: i64, cursor: &AtomicI64,
+                dependent_sequences: &[Arc<AtomicI64>],
+                barrier: &SequenceBarrier) -> Result<i64, BarrierError> {
+        let mut counter = self.retries;
+
+        loop {
+            barrier.check_alert()?;
+
+            let available = get_minimum_sequence(cursor, dependent_sequences);
+            if available >= sequence {
+                return Ok(available);
+            }
+
+            if counter > 100 {
+                counter -= 1;
+            } else if counter > 0 {
+                counter -= 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_nanos(1));
+            }
+        }
+    }
+
+    fn signal_all_when_blocking(&self) {}
+}
+
+/// Uses condition variable, lowest CPU usage.
+pub struct BlockingWaitStrategy {
+    mutex: Mutex<()>,
+    condvar: Condvar,
+}
+
+impl WaitStrategy for BlockingWaitStrategy {
+    fn wait_for(&self, sequence: i64, cursor: &AtomicI64,
+                dependent_sequences: &[Arc<AtomicI64>],
+                barrier: &SequenceBarrier) -> Result<i64, BarrierError> {
+        // Fast path: avoid the lock if data is already available.
+        barrier.check_alert()?;
+        let available = get_minimum_sequence(cursor, dependent_sequences);
+        if available >= sequence {
+            return Ok(available);
+        }
+
+        // Slow path: re-check *under the lock* before sleeping.
+        //
+        // The race this fixes:
+        //   1. Consumer checks condition → false (no data yet)
+        //   2. Producer publishes event (Release store to cursor)
+        //   3. Producer calls signal_all_when_blocking() → notify_all()
+        //   4. Consumer calls condvar.wait() ← MISSED the signal → deadlocked!
+        //
+        // By holding the mutex across the check AND the wait, and by requiring
+        // signal_all_when_blocking() to also hold the mutex before notify_all(),
+        // the window between step 1 and step 4 is serialised: a concurrent
+        // notify_all() either fires before we enter wait() (so we see new data on
+        // the next loop) or after (so it wakes us up). The race is closed.
+        let mut guard = self.mutex.lock().unwrap();
+        loop {
+            barrier.check_alert()?;
+            let available = get_minimum_sequence(cursor, dependent_sequences);
+            if available >= sequence {
+                return Ok(available);
+            }
+            // condvar.wait() atomically: drops the lock AND suspends the thread.
+            // Any signal arriving after we entered wait() will wake us.
+            guard = self.condvar.wait(guard).unwrap();
+        }
+    }
+
+    fn signal_all_when_blocking(&self) {
+        // MUST acquire the lock before notifying.
+        // This serialises with the consumer's condition check above:
+        // by the time notify_all() fires, the consumer is either already in
+        // condvar.wait() (will be woken) or has not yet entered it (will see
+        // the fresh data on its next condition check without sleeping).
+        let _guard = self.mutex.lock().unwrap();
+        self.condvar.notify_all();
+    }
+}
+
+/// Hybrid: spin -> yield -> sleep
+pub struct PhasedBackoffWaitStrategy {
+    spin_tries: u32,
+    yield_tries: u32,
+    sleep_nanos: u64,
+}
+
+impl WaitStrategy for PhasedBackoffWaitStrategy {
+    fn wait_for(&self, sequence: i64, cursor: &AtomicI64,
+                dependent_sequences: &[Arc<AtomicI64>],
+                barrier: &SequenceBarrier) -> Result<i64, BarrierError> {
+        let mut spin_counter = self.spin_tries;
+        let mut yield_counter = self.yield_tries;
+
+        loop {
+            barrier.check_alert()?;
+
+            let available = get_minimum_sequence(cursor, dependent_sequences);
+            if available >= sequence {
+                return Ok(available);
+            }
+
+            if spin_counter > 0 {
+                spin_counter -= 1;
+                std::hint::spin_loop();
+            } else if yield_counter > 0 {
+                yield_counter -= 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_nanos(self.sleep_nanos));
+            }
+        }
+    }
+
+    fn signal_all_when_blocking(&self) {}
 }
 ```
-
-**Timeout Semantics:**
-- Precision: Nanoseconds (uses `std::time::Instant`)
-- Behavior: Returns `BarrierError::Timeout` if exceeded
-- Interaction: Works with all wait strategies
 
 **Performance Characteristics:**
-- Zero-copy coordination (just atomic reads)
-- Minimal contention (consumers read, only producer writes cursor)
-- Batching: Returns highest available (process multiple events)
+```
+Strategy              | Latency (p50) | Latency (p99) | CPU (idle) | Power
+----------------------|---------------|---------------|------------|-------
+BusySpinWaitStrategy  | 50ns          | 100ns         | 100%       | High
+YieldingWaitStrategy  | 200ns         | 1μs           | 80%        | Med
+SleepingWaitStrategy  | 1μs           | 10μs          | 20%        | Low
+BlockingWaitStrategy  | 10μs          | 100μs         | 0%         | Min
+PhasedBackoffStrategy | 500ns         | 5μs           | 40%        | Med
+```
 
-**What's Next:** Post 5 explores wait strategies—trading latency for CPU.
+**Platform-Specific Considerations:**
+```rust
+// x86: PAUSE instruction (via spin_loop)
+#[cfg(target_arch = "x86_64")]
+std::hint::spin_loop(); // Compiles to PAUSE
+
+// ARM: YIELD instruction
+#[cfg(target_arch = "aarch64")]
+std::hint::spin_loop(); // Compiles to YIELD
+
+// thread::yield_now() behavior:
+// - Linux: sched_yield() (may not yield if no other runnable threads)
+// - Windows: SwitchToThread()
+// - macOS: sched_yield()
+```
+
+**Power Consumption:**
+- Busy-spin kills battery life on laptops/mobile
+- Use `SleepingWaitStrategy` for battery-powered devices
+- Use `BusySpinWaitStrategy` only for datacenter/HFT
+
+**When to Use Which:**
+- **HFT/Gaming**: `BusySpinWaitStrategy` (latency is everything)
+- **Real-time audio**: `YieldingWaitStrategy` (balance latency/CPU)
+- **Telemetry**: `SleepingWaitStrategy` (throughput matters, not latency)
+- **Background processing**: `BlockingWaitStrategy` (CPU-friendly)
+
+**What's Next:** Post 5 covers sequence barriers—how consumers coordinate.
 
 ---
 
-## Post 5 — Wait Strategies: Trading Latency for CPU
+## Post 5 — Sequence Barriers: Coordinating Dependencies
 
 **The Problem:**
 - Busy-spin: lowest latency (~50ns), 100% CPU usage
