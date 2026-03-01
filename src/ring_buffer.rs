@@ -28,15 +28,52 @@ struct RingBuffer<T> {
 }
 
 impl<T> RingBuffer<T> {
-    pub fn new<F>(size: usize, factory: F) -> Self {
-        todo!()
+
+    pub fn new<F>(size: usize, factory: F) -> Self
+    where
+        F: Fn() -> T,
+    {
+        assert!(size > 0, "Size must be greater than 0");
+        assert!(size.is_power_of_two(), "Size must be power of 2");
+
+        let mut buffer = Vec::with_capacity(size);
+        for _ in 0..size {
+            buffer.push(UnsafeCell::new(MaybeUninit::new(factory())));
+        }
+        let initialized = buffer.len();
+
+        RingBuffer {
+            _padding_left: [0; 64],
+            buffer: buffer.into_boxed_slice(),
+            index_mask: size - 1,
+            initialized: AtomicUsize::new(initialized),
+            _padding_right: [0; 64],
+        }
     }
 
+    #[inline]
     pub fn get(&self, sequence: i64) -> &T {
-        todo!()
+        let index = (sequence as usize) & self.index_mask;
+
+        // SAFETY:
+        // 1. Index is masked to buffer size (can't overflow)
+        // 2. Sequence barrier prevents wrap-around
+        // 3. Only one writer per slot
+        // 4. Slot is initialized (guaranteed by constructor)
+        unsafe { (*self.buffer[index].get()).assume_init_ref() }
     }
 
+    #[inline]
     pub fn get_mut(&self, sequence: i64) -> &mut T {
-        todo!()
+        let index = (sequence as usize) & self.index_mask;
+
+        // SAFETY: Same as get(), plus:
+        // 5. Caller has exclusive claim (via SequenceClaim)
+        unsafe { (*self.buffer[index].get()).assume_init_mut() }
+    }
+
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.buffer.len()
     }
 }
