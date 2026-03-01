@@ -14,4 +14,29 @@
 //! - Mastery Plan: `disruptor::ring_buffer`
 //! - LMAX: `com.lmax.disruptor.RingBuffer`
 
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicUsize;
 
+#[repr(C, align(64))]
+struct RingBuffer<T> {
+    _padding_left: [u8; 64],
+    buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    index_mask: usize,
+    initialized: AtomicUsize,
+    _padding_right: [u8; 64],
+}
+
+impl<T> RingBuffer<T> {
+    pub fn new<F>(size: usize, factory: F) -> Self {
+        todo!()
+    }
+
+    pub fn get(&self, sequence: i64) -> &T {
+        todo!()
+    }
+
+    pub fn get_mut(&self, sequence: i64) -> &mut T {
+        todo!()
+    }
+}
