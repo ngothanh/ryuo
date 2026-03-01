@@ -1,8 +1,8 @@
 # Building a Disruptor in Rust: Ryuo — Part 2A: The Ring Buffer
 
-**Series:** Building a Disruptor in Rust: Ryuo
-**Part:** 2A of 16
-**Target Audience:** Systems engineers building high-performance, low-latency applications
+**Series:** Building a Disruptor in Rust: Ryuo  
+**Part:** 2A of 16  
+**Target Audience:** Systems engineers building high-performance, low-latency applications  
 **Prerequisites:** Part 1, understanding of unsafe Rust, basic knowledge of CPU cache architecture
 
 ---
@@ -158,10 +158,9 @@ pub struct RingBuffer<T> {
     /// Fast indexing mask (capacity - 1)
     index_mask: usize,
 
-    /// Number of initialized slots (for panic-safe drop)
-    /// AtomicUsize allows reading in Drop without explicit &mut self.
-    /// No synchronization is needed - we only write during construction
-    /// and read during drop (both have exclusive access).
+    /// Number of initialized slots (for panic-safe drop).
+    /// AtomicUsize is idiomatic for fields in a Sync type, though only
+    /// &mut access is needed (construction and Drop both have exclusive access).
     initialized: AtomicUsize,
 
     /// Right padding (prevents false sharing with next fields)
@@ -298,7 +297,6 @@ unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
 ```
 
-
 ---
 
 ## Understanding the Safety Invariants
@@ -405,6 +403,8 @@ xor edx, edx          ; clear upper bits
 mov ecx, 1000
 div rcx               ; rdx = rax % rcx (35-90 cycles, low throughput)
 mov rax, rdx
+; Note: compilers optimize constant divisors via multiply-by-reciprocal,
+; but runtime-variable capacity (our case) emits actual DIV.
 
 ; Bitwise AND version (capacity = 1024, mask = 1023)
 mov rax, rdi          ; sequence
@@ -444,8 +444,8 @@ and rax, 1023         ; rax &= mask (1 cycle, high throughput)
 
 ## What We Haven't Covered
 
-The ring buffer is just storage. It doesn't handle:
-- **Cache-line padding** - How do we prevent false sharing? (Part 2B)
+The ring buffer is just storage. We haven't yet explained:
+- **Cache-line padding** - Why do we need `_padding_left`, `_padding_right`, and `align(64)`? (Part 2B)
 - **Coordination** - How do producers claim slots? (Post 3: Sequencers)
 - **Synchronization** - How do consumers know when data is ready? (Post 4: Wait Strategies)
 - **Dependencies** - How do multi-stage pipelines work? (Post 5: Sequence Barriers)

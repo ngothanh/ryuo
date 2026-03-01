@@ -3,7 +3,7 @@
 **Series:** Building a Disruptor in Rust: Ryuo  
 **Part:** 2B of 16  
 **Target Audience:** Systems engineers building high-performance, low-latency applications  
-**Prerequisites:** Part 2A (ring buffer implementation), basic knowledge of CPU cache architecture
+**Prerequisites:** Part 2A (ring buffer implementation), basic knowledge of CPU cache architecture  
 
 ---
 
@@ -13,9 +13,11 @@ In Part 2A, we built a pre-allocated, power-of-2, cache-aligned ring buffer. You
 
 In this post, we'll discover the problem through concrete scenarios, building from naive to perfect solutions. By the end, you'll understand not just **what** to do, but **why** each decision matters.
 
-We'll explore five different implementations, see exactly what goes wrong with each, and understand the trade-offs that led LMAX Disruptor to their production choice.
+We'll explore five progressively better Rust implementations, see exactly what goes wrong with each, and then compare our choice against LMAX Disruptor's Java-specific approach.
 
 ---
+
+## The Five Scenarios
 
 ### **Scenario 1: No Padding (32 bytes) - The Naive Approach**
 
@@ -495,13 +497,25 @@ struct Disruptor<T> {
 **Memory layout (from Scenario 4):**
 
 ```
-Cache Line 0 (bytes 0-63):    [producer_cursor:8][padding:56]
+Cache Line 0 (bytes 0-63):    [producer_cursor:8][compiler padding:56]
 Cache Line 1 (bytes 64-127):  [padding_left:64]
-Cache Line 2 (bytes 128-191): [buffer:16][index_mask:8][initialized:8][padding:32]
-Cache Line 3 (bytes 192-255): [padding_right:32][consumer_cursor:8][padding:24]
+Cache Line 2 (bytes 128-191): [buffer:16][index_mask:8][initialized:8][padding_right:32]
+Cache Line 3 (bytes 192-255): [padding_right:32][tail_padding:32]
+Cache Line 4 (bytes 256-319): [consumer_cursor:8][unused:56]
 ```
 
-**What goes wrong with prefetchers:**
+**What can go wrong with prefetchers:**
+
+With Scenario 4's layout, consumer_cursor is 2 cache lines away from the data fields (Lines 3 and 4 vs Line 2). Our specific struct happens to have enough tail padding to keep them apart. But consider a variant with more data fields:
+
+```
+Hypothetical layout (larger struct, thinner padding):
+Cache Line 2 (bytes 128-191): [fields:48][padding_right:16]
+Cache Line 3 (bytes 192-255): [padding_right:48][consumer_cursor:8][unused:8]
+                                                  ↑ Only 1 line away from data!
+```
+
+Now the prefetcher causes trouble:
 
 ```
 Time 1: Thread B (Core 2) reads ring_buffer fields (Line 2)
@@ -522,22 +536,15 @@ Time 2: Thread C (Core 3) writes consumer_cursor (Line 3)
 │ Core 3 Cache: [Line 3: Modified]                           │
 └─────────────────────────────────────────────────────────────┘
                          ↑ Cache coherence traffic! (20-50ns)
-
-Time 3: Thread B reads ring_buffer again
-┌─────────────────────────────────────────────────────────────┐
-│ CPU Prefetcher: "Let me fetch Line 3 again..."              │
-│                                                              │
-│ Core 2 Cache: [Line 3: Shared] ← Fetched from Core 3!      │
-│ Core 3 Cache: [Line 3: Shared] ← Downgraded to Shared      │
-└─────────────────────────────────────────────────────────────┘
-                         ↑ More cache coherence traffic!
 ```
 
-**This is "prefetcher false sharing"** - Line 3 (which contains padding AND consumer_cursor) is being bounced between cores due to prefetching, even though:
+**This is "prefetcher false sharing"** - Line 3 (which contains padding AND consumer_cursor) is bounced between cores due to prefetching, even though:
 - ✅ Thread B never writes to Line 3
 - ✅ Thread B never even accesses consumer_cursor
 - ❌ The **prefetcher** brought Line 3 into Core 2's cache
 - ❌ Cache coherence protocol sees conflict when Thread C writes
+
+**Note:** Our specific Scenario 4 RingBuffer (32 bytes of data fields) has enough tail padding that consumer_cursor lands 2 cache lines away — so this particular struct is safe from next-line prefetching. But the general principle applies: if your struct has more fields, or if the CPU prefetches more aggressively (e.g., Intel's DCU prefetcher fetches the paired line in a 128-byte aligned block), 64-byte padding may not be enough.
 
 **The solution:** Use **2 cache lines** (128 bytes) of padding to create a "buffer zone":
 
@@ -565,7 +572,8 @@ Byte 272-279: ring_buffer.index_mask (Thread B reads)
 Byte 280-287: ring_buffer.initialized (Thread B reads)
 Byte 288-351: ring_buffer._padding_right (64 bytes)
 Byte 352-415: ring_buffer._padding_right (64 bytes)
-Byte 416-423: consumer_cursor (Thread C writes)
+Byte 416-511: [alignment tail padding] ← Compiler pads to 384 bytes (align 128)
+Byte 512-519: consumer_cursor (Thread C writes)
 ```
 
 **Cache line view:**
@@ -575,10 +583,11 @@ Cache Line 0 (bytes 0-63):    [producer_cursor:8][padding:56]
 Cache Line 1 (bytes 64-127):  [compiler padding:64]
 Cache Line 2 (bytes 128-191): [padding_left:64]
 Cache Line 3 (bytes 192-255): [padding_left:64]
-Cache Line 4 (bytes 256-319): [buffer:16][index_mask:8][initialized:8][padding:32]
+Cache Line 4 (bytes 256-319): [buffer:16][index_mask:8][initialized:8][padding_right:32]
 Cache Line 5 (bytes 320-383): [padding_right:64]
-Cache Line 6 (bytes 384-447): [padding_right:64]
-Cache Line 7 (bytes 448-511): [consumer_cursor:8][padding:56]
+Cache Line 6 (bytes 384-447): [padding_right:32][tail_padding:32]
+Cache Line 7 (bytes 448-511): [tail_padding:64]
+Cache Line 8 (bytes 512-575): [consumer_cursor:8][unused:56]
 ```
 
 **Now what happens with prefetchers:**
@@ -594,26 +603,26 @@ Time 1: Thread B (Core 2) reads ring_buffer fields (Line 4)
 │               [Line 5: Shared] ← Prefetched, but just padding│
 └─────────────────────────────────────────────────────────────┘
 
-Time 2: Thread C (Core 3) writes consumer_cursor (Line 7)
+Time 2: Thread C (Core 3) writes consumer_cursor (Line 8)
 ┌─────────────────────────────────────────────────────────────┐
-│ CPU Prefetcher: "Thread C is writing Line 7, let me help!"  │
-│   Fetches Line 7 (requested)                                │
-│   Fetches Line 6 (previous-line prefetch) ← Just padding!   │
+│ CPU Prefetcher: "Thread C is writing Line 8, let me help!"  │
+│   Fetches Line 8 (requested)                                │
+│   Fetches Line 7 (previous-line prefetch) ← Just padding!   │
 │                                                              │
 │ Core 2 Cache: [Line 4: Shared] ← Still valid!              │
 │               [Line 5: Shared] ← Still valid!              │
-│ Core 3 Cache: [Line 6: Shared] ← No conflict with Core 2!  │
-│               [Line 7: Modified]                            │
+│ Core 3 Cache: [Line 7: Shared] ← No conflict with Core 2!  │
+│               [Line 8: Modified]                            │
 └─────────────────────────────────────────────────────────────┘
                          ↑ No cache coherence traffic!
 
-Lines 5 and 6 are different - no conflict!
+Lines 5 and 7 are different - no conflict!
 ```
 
 **Why it works:**
-- ✅ 2 cache lines of padding create a "buffer zone"
+- ✅ 2+ cache lines of padding + tail padding create a "buffer zone"
 - ✅ Prefetcher can fetch adjacent lines without causing conflicts
-- ✅ Line 5 (prefetched by Thread B) ≠ Line 6 (prefetched by Thread C)
+- ✅ Line 5 (prefetched by Thread B) ≠ Line 7 (prefetched by Thread C)
 - ✅ No false sharing, even with aggressive prefetchers
 
 **The cost:** The struct itself is 384 bytes (`std::mem::size_of`, including 96 bytes of alignment tail padding). When embedded after a smaller field, the compiler may insert up to 120 bytes of external alignment padding.
@@ -814,7 +823,7 @@ When implementing cache-line padding, consider these factors:
 - ✅ Your benchmarks show acceptable performance
 - ⚠️ You understand this doesn't guarantee alignment in Rust
 
-#### **Choose Aligned Padding (216+ bytes) if:**
+#### **Choose Aligned Padding (192 bytes) if:**
 - ✅ You need guaranteed cache-line alignment
 - ✅ Memory cost is acceptable
 - ✅ You want to eliminate alignment uncertainty
@@ -863,7 +872,8 @@ Scenario 4: Aligned Padding (192 bytes) - Our Choice (Rust)
 │ Cache Line 0: [prev][compiler padding]                     │
 │ Cache Line 1: [padding_left: 64 bytes]                     │
 │ Cache Line 2: [RingBuffer fields][padding_right...]        │
-│ Cache Line 3: [padding_right][next]                        │
+│ Cache Line 3: [padding_right + tail padding]               │
+│ Cache Line 4: [next]                                       │
 └─────────────────────────────────────────────────────────────┘
 ✅ Guaranteed alignment, perfect isolation
 ✅ Correctness over cleverness
