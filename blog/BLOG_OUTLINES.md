@@ -102,11 +102,12 @@ Total per hop: 10-50μs typical, 100-500μs under load
 - Compile-time memory safety
 - Fearless concurrency (ownership prevents data races)
 
-**What's Next:** Post 2 dives into the ring buffer—the core data structure.
+**What's Next:** Post 2A dives into the ring buffer—the core data structure. Post 2B covers cache-line padding.
 
 ---
 
-## Post 2 — The Ring Buffer: Pre-Allocated, Power-of-2, Cache-Aligned
+## Post 2A — The Ring Buffer: Pre-Allocated, Power-of-2, Cache-Aligned
+## Post 2B — Cache-Line Padding: Preventing False Sharing
 
 **The Problem:**
 - Linked lists cause cache misses (pointer chasing)

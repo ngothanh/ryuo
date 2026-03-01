@@ -290,7 +290,7 @@ Every push/pop causes cache line invalidation between cores. With Disruptor, we 
 ```rust
 // NOTE: 64-byte cache lines are standard on x86-64.
 // ARM64 (Apple Silicon, Ampere, AWS Graviton) uses 128-byte lines.
-// Post 2 covers the full cross-platform story; for now we assume x86-64.
+// Post 2B covers the full cross-platform story; for now we assume x86-64.
 #[repr(align(64))]  // Force 64-byte alignment (one x86-64 cache line)
 struct Producer {
     cursor: AtomicI64,
@@ -501,7 +501,7 @@ Rust gives you control over memory layout:
 struct CachePadding([u8; 64]);
 ```
 
-This is critical for preventing **false sharing** (more on this in Post 2).
+This is critical for preventing **false sharing** (more on this in Post 2B).
 
 ---
 
@@ -586,7 +586,8 @@ When you see a 10ms spike at p99.99, how do you debug it? You need:
 
 Over the next 15 posts, we'll build Ryuo from scratch:
 
-- **Post 2**: Ring buffer (pre-allocated, cache-aligned)
+- **Post 2A**: Ring buffer (pre-allocated, power-of-2, unsafe interior mutability)
+- **Post 2B**: Cache-line padding (preventing false sharing)
 - **Post 3**: Sequencers (single/multi-producer coordination)
 - **Post 4**: Wait strategies (busy-spin, yielding, blocking)
 - **Post 5**: Sequence barriers (dependency tracking)
@@ -608,12 +609,13 @@ Each post will include:
 
 ## Next Up: The Ring Buffer
 
-In **Part 2**, we'll build the core data structure: a **pre-allocated, power-of-2, cache-aligned ring buffer**. You'll learn:
+In **Part 2A**, we'll build the core data structure: a **pre-allocated, power-of-2, cache-aligned ring buffer**. You'll learn:
 
 - Why `Vec<T>` is the wrong choice
 - How to use `UnsafeCell` and `MaybeUninit` safely
 - The magic of bitwise AND for indexing
-- Cache-line padding to prevent false sharing
+
+Then in **Part 2B**, we'll deep-dive into cache-line padding to prevent false sharing.
 
 **Teaser:** We'll achieve **O(1) indexing with bitwise AND (1-2 CPU cycles)** and zero allocations. Actual access time depends on cache state (1ns if in L1, 50-300ns if in RAM).
 
@@ -647,7 +649,7 @@ In **Part 2**, we'll build the core data structure: a **pre-allocated, power-of-
 
 ---
 
-**Next:** [Part 2 — The Ring Buffer: Pre-Allocated, Power-of-2, Cache-Aligned →](post-02-ring-buffer.md)
+**Next:** [Part 2A — The Ring Buffer: Pre-Allocated, Power-of-2, Cache-Aligned →](post2A.md)
 
 ---
 

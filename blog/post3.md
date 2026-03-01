@@ -3,14 +3,14 @@
 **Series:** Building a Disruptor in Rust: Ryuo
 **Part:** 3 of 16
 **Target Audience:** Systems engineers building high-performance, low-latency applications
-**Prerequisites:** Part 1 (latency fundamentals), Part 2 (ring buffer implementation)
+**Prerequisites:** Part 1 (latency fundamentals), Part 2A (ring buffer implementation), Part 2B (cache-line padding)
 
 ---
 
 ## From Storage to Coordination
 
-In Part 2, we built a ring buffer with:
-- ✅ **Fast indexing** - Bitwise AND instead of modulo (3-11x faster)
+In Parts 2A and 2B, we built a ring buffer with:
+- ✅ **Fast indexing** - Bitwise AND instead of modulo (35-90x faster)
 - ✅ **Interior mutability** - `UnsafeCell` allows concurrent access
 - ✅ **Cache-line isolation** - Prevents false sharing
 
