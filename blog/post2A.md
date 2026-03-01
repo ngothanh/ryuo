@@ -450,7 +450,7 @@ The ring buffer is just storage. We haven't yet explained:
 - **Synchronization** - How do consumers know when data is ready? (Post 4: Wait Strategies)
 - **Dependencies** - How do multi-stage pipelines work? (Post 5: Sequence Barriers)
 
-The ring buffer provides fast, cache-friendly storage. In **Part 2B**, we'll explore why the `#[repr(C, align(64))]` and padding fields in our struct are essential — through five progressively complex cache-line padding scenarios.
+The ring buffer provides fast, cache-friendly storage. In **Part 2B**, we'll explore why the `#[repr(C, align(64))]` and padding fields in our struct are essential — through four progressively better cache-line padding scenarios.
 
 ---
 
@@ -458,9 +458,8 @@ The ring buffer provides fast, cache-friendly storage. In **Part 2B**, we'll exp
 
 In **Part 2B**, we'll deep-dive into cache-line padding — the technique that prevents false sharing between producer and consumer:
 
-- **Five scenarios** from naive (32 bytes) to paranoid (384 bytes)
+- **Four scenarios** from naive (32 bytes) to aligned (192 bytes)
 - **Why LMAX chose "good enough" padding** — and why we chose different in Rust
-- **The DCU prefetcher trap** — when 64-byte alignment isn't enough
 - **Memory layout diagrams** with exact byte offsets
 
 **Teaser:** False sharing can add 20-150ns per write. Our padding strategy eliminates it entirely.
