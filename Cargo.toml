@@ -1,0 +1,13 @@
+[package]
+name = "ryuo"
+version = "0.1.0"
+edition = "2024"
+description = "A production-grade Disruptor pattern implementation in Rust — sub-microsecond messaging"
+license = "MIT"
+repository = "https://github.com/yourusername/ryuo"
+keywords = ["disruptor", "lock-free", "low-latency", "ring-buffer", "hft"]
+categories = ["concurrency", "data-structures"]
+
+[dependencies]
+
+[dev-dependencies]
