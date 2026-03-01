@@ -164,7 +164,7 @@ Byte 104-111: consumer_cursor (Thread C writes)
 ```
 Cache Line 0 (bytes 0-63):
 ┌─────────────────────────────────────────────────────────────┐
-│ [producer_cursor:8][buffer:16][index_mask:8][initialized:8]│
+│ [producer_cursor:8][buffer:16][index_mask:8][initialized:8] │
 │ [padding_right:24]                                          │
 └─────────────────────────────────────────────────────────────┘
   ↑ Thread A writes    ↑ Thread B reads
@@ -173,7 +173,7 @@ Cache Line 0 (bytes 0-63):
 
 Cache Line 1 (bytes 64-127):
 ┌─────────────────────────────────────────────────────────────┐
-│ [padding_right:40][consumer_cursor:8][unused:16]           │
+│ [padding_right:40][consumer_cursor:8][unused:16]            │
 └─────────────────────────────────────────────────────────────┘
                        ↑ Thread C writes - OK, isolated!
 ```
