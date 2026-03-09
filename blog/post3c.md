@@ -404,7 +404,7 @@ In **Part 4**, we'll build the consumer side:
 
 ---
 
-**Next:** [Part 4 — Wait Strategies & Sequence Barriers →](post4.md)
+**Next:** [Part 4 — Wait Strategies: Trading Latency for CPU →](post4.md)
 
 ---
 
