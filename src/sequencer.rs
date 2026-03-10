@@ -16,3 +16,18 @@
 //! - Mastery Plan: `disruptor::sequence_barrier` (gating sequences)
 //! - LMAX: `com.lmax.disruptor.SingleProducerSequencer`, `MultiProducerSequencer`
 
+pub trait Sequencer: Send {
+    /// Claim `count` slots. Blocks until available.
+    fn claim(&self, count: usize) -> SequenceClaim;
+
+    /// Try to claim `count` slots. Returns immediately.
+    fn try_claim(&self, count: usize) -> Result<SequenceClaim, InsufficientCapacity>;
+
+    /// Get current cursor position
+    fn cursor(&self) -> i64;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InsufficientCapacity;
+
+pub struct SequenceClaim {}
