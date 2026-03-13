@@ -28,7 +28,6 @@ struct RingBuffer<T> {
 }
 
 impl<T> RingBuffer<T> {
-
     pub fn new<F>(size: usize, factory: F) -> Self
     where
         F: Fn() -> T,
@@ -77,3 +76,17 @@ impl<T> RingBuffer<T> {
         self.buffer.len()
     }
 }
+
+impl<T> Drop for RingBuffer<T> {
+    fn drop(&mut self) {
+        let initialized = *self.initialized.get_mut();
+
+        for i in 0..initialized {
+            unsafe { (*self.buffer[i].get()).assume_init_drop() }
+        }
+    }
+}
+
+unsafe impl<T: Send> Send for RingBuffer<T> {}
+
+unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
