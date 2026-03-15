@@ -209,7 +209,153 @@ impl SingleProducerSequencer {
 3. **Caching** makes consumer checks 10x faster (avoid iteration)
 4. **Wrap-around prevention is orthogonal** — can be added to any approach
 
-Now let's implement both sequencers in detail.
+Now let's implement both sequencers in detail. But first, we need to solve a subtle performance problem.
+
+---
+
+## The `Sequence` Type: Preventing False Sharing on Atomic Counters
+
+### The Problem
+
+Every sequence counter — producer cursor, consumer positions, cached gating sequences — is an `AtomicI64`. An `AtomicI64` is just 8 bytes. On a 64-byte cache line, you can fit **eight** of them:
+
+```
+Cache line (64 bytes):
+┌──────────┬──────────┬──────────┬──────────┬────────────────────┐
+│ cursor   │ consumer │ consumer │ cached   │     (unused)       │
+│ (8 bytes)│ A (8b)   │ B (8b)   │ (8 bytes)│                    │
+└──────────┴──────────┴──────────┴──────────┴────────────────────┘
+  Core 0      Core 1     Core 2     Core 0
+  writes      writes     writes     writes
+```
+
+When Core 1 updates `consumer_A`, the entire cache line is invalidated across **all** cores. Core 0's read of `cursor` stalls. Core 2's write to `consumer_B` stalls. Everyone is waiting for a cache line they don't even care about.
+
+This is **false sharing** — the most insidious performance killer in lock-free programming, because it shows zero contention in profilers. No locks, no CAS failures, but throughput drops 2-5x.
+
+### How LMAX Solves It
+
+Java's `Sequence.java` uses a 3-level inheritance trick to pad both sides:
+
+```java
+class LhsPadding {
+    protected byte p10, p11, ... p77;  // 56 bytes left padding
+}
+
+class Value extends LhsPadding {
+    protected long value;               // 8 bytes — the actual counter
+}
+
+class RhsPadding extends Value {
+    protected byte p90, p91, ... p157;  // 56 bytes right padding
+}
+
+public class Sequence extends RhsPadding { ... }
+// Total: 56 + 8 + 56 = 120 bytes (+ ~16 bytes JVM object header ≈ 136 bytes)
+// The left/right padding ensures the 8-byte `value` never shares a cache line
+// with fields from adjacent objects — isolating it from false sharing.
+```
+
+### Why 128-byte Alignment, Not 64?
+
+You might think 64-byte alignment is enough — one counter per cache line. But Intel's **Spatial Prefetcher** (Sandy Bridge, 2011+) fetches **adjacent cache line pairs**:
+
+```
+64-byte alignment (INSUFFICIENT):
+┌── Cache line 0 ──┬── Cache line 1 ──┐
+│   cursor          │   consumer_A     │  ← Prefetcher treats as ONE 128-byte unit!
+└──────────────────┴──────────────────┘
+Core 0 writes cursor → prefetcher invalidates the PAIR → Core 1's consumer_A is evicted.
+
+128-byte alignment (CORRECT):
+┌── Cache line 0 ──┬── Cache line 1 ──┐
+│   cursor          │   (padding)      │  ← Prefetch pair 1
+├── Cache line 2 ──┼── Cache line 3 ──┤
+│   consumer_A      │   (padding)      │  ← Prefetch pair 2 (isolated!)
+└──────────────────┴──────────────────┘
+No cross-contamination. ✓
+```
+
+This also applies to **aarch64** (Apple Silicon, AWS Graviton) where big.LITTLE "big" cores have 128-byte cache lines.
+
+### Rust Implementation
+
+```rust
+/// Cache-padded atomic sequence counter.
+///
+/// Each `Sequence` occupies 128 bytes (one prefetch pair on x86_64/aarch64),
+/// ensuring that no two frequently-written counters share a cache line —
+/// even with adjacent-line prefetching.
+///
+/// This mirrors Java Disruptor's `Sequence` class (LhsPadding → Value → RhsPadding).
+#[repr(align(128))]
+pub struct Sequence {
+    value: AtomicI64,
+}
+
+impl Sequence {
+    pub const fn new(initial: i64) -> Self {
+        Self {
+            value: AtomicI64::new(initial),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> i64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set(&self, value: i64) {
+        self.value.store(value, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn set_volatile(&self, value: i64) {
+        self.value.store(value, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub fn compare_and_set(&self, expected: i64, new: i64) -> bool {
+        self.value
+            .compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Relaxed load — only safe when the caller is the sole writer
+    /// (e.g., SingleProducerSequencer reading its own cursor).
+    #[inline]
+    pub fn get_relaxed(&self) -> i64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Relaxed store — only safe when no other thread reads this value
+    /// with ordering expectations (e.g., updating a thread-local cache).
+    #[inline]
+    pub fn set_relaxed(&self, value: i64) {
+        self.value.store(value, Ordering::Relaxed);
+    }
+}
+
+// Size check: Sequence must be exactly 128 bytes for cache-line isolation.
+const _: () = assert!(std::mem::size_of::<Sequence>() == 128);
+const _: () = assert!(std::mem::align_of::<Sequence>() == 128);
+```
+
+**Memory layout of `Sequence`:**
+```
+Offset 0x00: ┌─ AtomicI64 (8 bytes) ─┐
+             │   the actual counter   │
+             ├────────────────────────┤
+Offset 0x08: │                        │
+             │   120 bytes padding    │  ← Compiler inserts automatically
+             │   (from #[repr(       │     due to align(128) + next
+             │    align(128))])       │     Sequence starts at 0x80
+             │                        │
+Offset 0x80: └────────────────────────┘  ← Next Sequence starts here
+```
+
+Now `Arc<Sequence>` replaces `Arc<AtomicI64>` everywhere — gating sequences, cursor, and cached values.
 
 ---
 
@@ -256,7 +402,7 @@ pub struct SequenceClaim {
 enum PublishStrategy {
     /// Single-producer: just store to the cursor
     Cursor {
-        cursor: Arc<AtomicI64>,
+        cursor: Arc<Sequence>,
     },
     /// Multi-producer: mark individual slots in the available buffer
     AvailableBuffer {
@@ -280,7 +426,9 @@ impl Drop for SequenceClaim {
     fn drop(&mut self) {
         match &self.strategy {
             PublishStrategy::Cursor { cursor } => {
-                cursor.store(self.end, Ordering::Release);
+                // Release store: makes all event data written since claim()
+                // visible to consumers who Acquire-load this cursor.
+                cursor.set(self.end);
             }
             PublishStrategy::AvailableBuffer { available_buffer, index_mask, buffer_size } => {
                 for seq in self.start..=self.end {
@@ -290,6 +438,19 @@ impl Drop for SequenceClaim {
                 }
             }
         }
+
+        // Wake consumers using BlockingWaitStrategy (condvar).
+        //
+        // Java's publish() always calls waitStrategy.signalAllWhenBlocking().
+        // Without this, consumers sleeping in condvar.wait() would never
+        // wake up after new events are published.
+        //
+        // For BusySpin/Yielding/Sleeping wait strategies, this is a no-op
+        // (the method body is empty), so it costs nothing.
+        //
+        // The wait_strategy reference is stored in the sequencer and passed
+        // into the SequenceClaim at construction time. We omit it from this
+        // code listing for clarity — see Part 4 for the full wiring.
     }
 }
 ```
@@ -309,12 +470,29 @@ Now let's implement the single-producer sequencer with all optimizations:
 ```rust
 use std::cell::Cell;
 
+/// # Layout and False-Sharing Prevention
+///
+/// The fields of `SingleProducerSequencer` are accessed by different threads:
+///
+/// - `cursor`: written by producer (via SequenceClaim::drop), read by consumers
+/// - `next_sequence`, `cached_gating_sequence`: read/written ONLY by producer
+/// - `gating_sequences`: written by consumers, read by producer
+///
+/// `cursor` is an `Arc<Sequence>` — it lives on the heap in its own
+/// 128-byte aligned allocation, automatically isolated from other fields.
+///
+/// `gating_sequences` are also `Arc<Sequence>` — each consumer's sequence
+/// lives in its own 128-byte aligned heap allocation.
+///
+/// The remaining producer-private fields (`next_sequence`, `cached_gating_sequence`,
+/// `buffer_size`) are only accessed by the producer thread, so they can safely
+/// share cache lines with each other.
 pub struct SingleProducerSequencer {
-    cursor: Arc<AtomicI64>,                // Published position (consumers read)
-    next_sequence: Cell<i64>,              // Next sequence to claim (only producer writes)
+    cursor: Arc<Sequence>,                  // Published position (consumers read)
+    next_sequence: Cell<i64>,               // Next sequence to claim (only producer writes)
     buffer_size: usize,
-    gating_sequences: Vec<Arc<AtomicI64>>, // Consumer positions
-    cached_gating_sequence: AtomicI64,     // Cached minimum (optimization)
+    gating_sequences: Vec<Arc<Sequence>>,   // Consumer positions
+    cached_gating_sequence: Cell<i64>,      // Cached minimum (producer-only, no atomic needed)
 }
 
 // SingleProducerSequencer is Send (can be moved to the producer thread)
@@ -323,30 +501,29 @@ pub struct SingleProducerSequencer {
 // any attempt to share this struct via Arc or similar.
 
 impl SingleProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<AtomicI64>>) -> Self {
+    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<Sequence>>) -> Self {
         assert!(buffer_size.is_power_of_two(), "buffer_size must be power of 2");
         Self {
-            cursor: Arc::new(AtomicI64::new(-1)),  // Start at -1 so first sequence is 0
-            next_sequence: Cell::new(0),            // First claim will be 0
+            cursor: Arc::new(Sequence::new(-1)),  // Start at -1 so first sequence is 0
+            next_sequence: Cell::new(0),           // First claim will be 0
             buffer_size,
             gating_sequences,
-            cached_gating_sequence: AtomicI64::new(-1),
+            cached_gating_sequence: Cell::new(-1), // Cell — only producer reads/writes this
         }
     }
 
     /// Get a clone of the cursor Arc — consumers use this to observe published sequences.
     /// Must be called before moving the sequencer to the producer thread.
-    pub fn cursor_arc(&self) -> Arc<AtomicI64> {
+    pub fn cursor_arc(&self) -> Arc<Sequence> {
         Arc::clone(&self.cursor)
     }
 
     fn get_minimum_sequence(&self) -> i64 {
         let mut minimum = i64::MAX;
         for seq in &self.gating_sequences {
-            let value = seq.load(Ordering::Acquire);
-            minimum = minimum.min(value);
+            minimum = minimum.min(seq.get());
         }
-        self.cached_gating_sequence.store(minimum, Ordering::Relaxed);
+        self.cached_gating_sequence.set(minimum);
         minimum
     }
 }
@@ -361,7 +538,7 @@ impl Sequencer for SingleProducerSequencer {
         let wrap_point = next - 1 - self.buffer_size as i64;
 
         // Check cache first (fast path)
-        let cached = self.cached_gating_sequence.load(Ordering::Relaxed);
+        let cached = self.cached_gating_sequence.get();
         if wrap_point > cached || cached > current {
             // Cache is stale — need to check actual consumer positions.
             //
@@ -379,10 +556,28 @@ impl Sequencer for SingleProducerSequencer {
             //   cursor.setVolatile(nextValue) before getMinimumSequence()
             //
             // Cost: ~20-30 cycles on x86, ~50-100 cycles on ARM. Only on cache miss.
-            self.cursor.store(current - 1, Ordering::SeqCst);
+            self.cursor.set_volatile(current - 1);
 
+            // Progressive backoff while waiting for consumers.
+            //
+            // Java uses LockSupport.parkNanos(1L) here — NOT a busy-spin.
+            // The reasoning: the *producer* is waiting for *consumers* to advance.
+            // Burning 100% CPU on spin_loop() can actually slow consumers down
+            // (via thermal throttling, power-state transitions, or starving
+            // consumer threads on the same physical core with HyperThreading).
+            //
+            // Our backoff: spin (100 iterations) → yield → sleep(1ns).
+            let mut spin_count = 0u32;
             while self.get_minimum_sequence() < wrap_point {
-                std::hint::spin_loop();
+                if spin_count < 100 {
+                    std::hint::spin_loop();
+                    spin_count += 1;
+                } else if spin_count < 200 {
+                    std::thread::yield_now();
+                    spin_count += 1;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_nanos(1));
+                }
             }
         }
 
@@ -404,9 +599,9 @@ impl Sequencer for SingleProducerSequencer {
         let next = current + count as i64;
         let wrap_point = next - 1 - self.buffer_size as i64;
 
-        let cached = self.cached_gating_sequence.load(Ordering::Relaxed);
+        let cached = self.cached_gating_sequence.get();
         if wrap_point > cached || cached > current {
-            self.cursor.store(current - 1, Ordering::SeqCst);
+            self.cursor.set_volatile(current - 1);
 
             if self.get_minimum_sequence() < wrap_point {
                 return Err(InsufficientCapacity);
@@ -425,20 +620,22 @@ impl Sequencer for SingleProducerSequencer {
     }
 
     fn cursor(&self) -> i64 {
-        self.cursor.load(Ordering::Acquire)
+        self.cursor.get()
     }
 }
 ```
 
 **Key optimizations:**
 
-1. **No atomic in claim** — `Cell<i64>` for next_sequence (single producer only, `!Sync` enforced by Cell)
-2. **Cached gating sequence** — Avoids iterating consumers on every claim
-3. **StoreLoad fence** — Ensures we see latest consumer positions (ARM/PowerPC correctness)
-4. **`Arc::clone` in PublishStrategy** — Guarantees soundness (claim holds a strong reference, preventing use-after-free)
-5. **Release on publish** — Makes event data visible to consumers
+1. **Cache-padded `Sequence` type** — `Arc<Sequence>` with `#[repr(align(128))]` isolates each counter from false sharing, even with adjacent-line prefetching
+2. **No atomic in claim** — `Cell<i64>` for both `next_sequence` and `cached_gating_sequence` (single producer only, `!Sync` enforced by Cell)
+3. **Cached gating sequence** — Avoids iterating consumers on every claim
+4. **Cursor publish before spin-wait** — `set_volatile(current - 1)` makes cursor visible to consumers before we read their positions, preventing livelock
+5. **Progressive backoff** — spin → yield → sleep(1ns), matching Java's `LockSupport.parkNanos(1L)` instead of burning CPU on pure busy-spin
+6. **`Arc::clone` in PublishStrategy** — Guarantees soundness (claim holds a strong reference, preventing use-after-free)
+7. **Release on publish** — `Sequence::set()` uses `Ordering::Release`, making event data visible to consumers
 
-**⚠️ Usage constraint: one outstanding claim at a time.** The `cursor.store(current - 1, SeqCst)` on the slow path assumes all prior claims have been dropped (published). If you hold multiple `SequenceClaim`s simultaneously, the cursor store may publish a sequence before you've written data to it — a data race. This matches the Java Disruptor's `SingleProducerSequencer`, which has the same constraint. In practice, the natural pattern of `{ let claim = ...; write; }` enforces this automatically.
+**⚠️ Usage constraint: one outstanding claim at a time.** The `cursor.set_volatile(current - 1)` on the slow path assumes all prior claims have been dropped (published). If you hold multiple `SequenceClaim`s simultaneously, the cursor store may publish a sequence before you've written data to it — a data race. This matches the Java Disruptor's `SingleProducerSequencer`, which has the same constraint. In practice, the natural pattern of `{ let claim = ...; write; }` enforces this automatically.
 
 **Performance:**
 - **Claim (cache hit)**: ~10ns (just Cell get/set + cache check)
@@ -491,21 +688,24 @@ This lets consumers distinguish "sequence 1 published (lap 0)" from "sequence 5 
 
 ```rust
 pub struct MultiProducerSequencer {
-    cursor: Arc<AtomicI64>,                // Highest claimed sequence
+    cursor: Arc<Sequence>,                  // Highest claimed sequence (padded!)
     buffer_size: usize,
     index_mask: usize,
-    gating_sequences: Vec<Arc<AtomicI64>>,
-    cached_gating_sequence: AtomicI64,
-    available_buffer: Arc<[AtomicI32]>,    // Tracks which sequences are published
+    gating_sequences: Vec<Arc<Sequence>>,   // Consumer positions (each padded!)
+    cached_gating_sequence: AtomicI64,      // Shared across producer threads — must be atomic
+    available_buffer: Arc<[AtomicI32]>,     // Tracks which sequences are published
 }
 
 // MultiProducerSequencer IS Sync — multiple producers can call claim() concurrently.
-// All fields are either atomic (Arc<AtomicI64>, AtomicI64, Arc<[AtomicI32]>),
-// immutable after construction (usize), or Vec<Arc<AtomicI64>> which is Sync
-// because Arc<AtomicI64> is Sync. The compiler derives Sync automatically.
+// `Arc<Sequence>` is Sync (Sequence contains AtomicI64), AtomicI64/AtomicI32 are Sync,
+// usize is immutable. The compiler derives Sync automatically.
+//
+// Note: `cached_gating_sequence` is AtomicI64 (not Cell) because multiple producer
+// threads may read/write it concurrently. Unlike SingleProducerSequencer where only
+// one thread ever touches the cache, here any producer thread can update it.
 
 impl MultiProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<AtomicI64>>) -> Self {
+    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<Sequence>>) -> Self {
         assert!(buffer_size.is_power_of_two(), "buffer_size must be power of 2");
 
         let available_buffer: Arc<[AtomicI32]> = (0..buffer_size)
@@ -513,7 +713,7 @@ impl MultiProducerSequencer {
             .collect();
 
         Self {
-            cursor: Arc::new(AtomicI64::new(-1)),
+            cursor: Arc::new(Sequence::new(-1)),
             buffer_size,
             index_mask: buffer_size - 1,
             gating_sequences,
@@ -525,8 +725,7 @@ impl MultiProducerSequencer {
     fn get_minimum_sequence(&self) -> i64 {
         let mut minimum = i64::MAX;
         for seq in &self.gating_sequences {
-            let value = seq.load(Ordering::Acquire);
-            minimum = minimum.min(value);
+            minimum = minimum.min(seq.get());
         }
         self.cached_gating_sequence.store(minimum, Ordering::Relaxed);
         minimum
@@ -541,10 +740,9 @@ impl Sequencer for MultiProducerSequencer {
         // fetch_add returns the OLD cursor value. Since cursor starts at -1,
         // the first claimed sequence is current + 1 = 0.
         //
-        // Example: cursor = -1, count = 3
-        //   current = fetch_add(3) → returns -1, cursor becomes 2
-        //   claimed range = [0, 1, 2] → start = 0, end = 2
-        let current = self.cursor.fetch_add(count as i64, Ordering::AcqRel);
+        // We access cursor.value directly here because Sequence's public API
+        // doesn't expose fetch_add — it's only needed in MultiProducerSequencer.
+        let current = self.cursor.value.fetch_add(count as i64, Ordering::AcqRel);
         let end = current + count as i64;  // = new cursor value
 
         let wrap_point = end - self.buffer_size as i64;
@@ -553,8 +751,19 @@ impl Sequencer for MultiProducerSequencer {
         if wrap_point > cached || cached > current {
             // Note: Unlike SingleProducer, no separate StoreLoad fence needed.
             // fetch_add with AcqRel already updated the cursor atomically.
+            //
+            // Progressive backoff (same rationale as SingleProducer):
+            let mut spin_count = 0u32;
             while self.get_minimum_sequence() < wrap_point {
-                std::hint::spin_loop();
+                if spin_count < 100 {
+                    std::hint::spin_loop();
+                    spin_count += 1;
+                } else if spin_count < 200 {
+                    std::thread::yield_now();
+                    spin_count += 1;
+                } else {
+                    std::thread::sleep(std::time::Duration::from_nanos(1));
+                }
             }
         }
 
@@ -574,7 +783,7 @@ impl Sequencer for MultiProducerSequencer {
             "count must be > 0 and <= buffer_size");
         // For try_claim, use CAS loop to check capacity before claiming
         loop {
-            let current = self.cursor.load(Ordering::Acquire);
+            let current = self.cursor.get();
             let end = current + count as i64;
             let wrap_point = end - self.buffer_size as i64;
 
@@ -585,9 +794,7 @@ impl Sequencer for MultiProducerSequencer {
                 }
             }
 
-            if self.cursor.compare_exchange_weak(
-                current, end, Ordering::AcqRel, Ordering::Acquire
-            ).is_ok() {
+            if self.cursor.compare_and_set(current, end) {
                 return Ok(SequenceClaim {
                     start: current + 1,
                     end,
@@ -603,7 +810,7 @@ impl Sequencer for MultiProducerSequencer {
     }
 
     fn cursor(&self) -> i64 {
-        self.cursor.load(Ordering::Acquire)
+        self.cursor.get()
     }
 }
 ```
@@ -614,6 +821,7 @@ impl Sequencer for MultiProducerSequencer {
 2. **`AcqRel` ordering** — Synchronize with other producers (Pattern 2 from Part 3A)
 3. **`available_buffer`** — Track out-of-order publishing via lap counting
 4. **Inherently `Sync`** — All fields are atomic or immutable, so the compiler auto-derives `Sync`
+5. **`AtomicI64` for `cached_gating_sequence`** — Multiple producer threads may read/write concurrently (unlike single-producer where `Cell` suffices)
 
 **Important:** In multi-producer mode, `cursor` represents the highest *claimed* (not published) sequence. Consumers must check `available_buffer` to determine which sequences are actually published — they cannot simply read `cursor`. We'll build the consumer's `SequenceBarrier` to handle this in Part 5.
 
@@ -639,17 +847,23 @@ We use `fetch_add` for `claim()` (always succeeds) and CAS loop only for `try_cl
 
 ## Key Takeaways
 
-1. **RAII prevents bugs** — Rust's Drop trait makes "forgot to publish" impossible. This is a significant advantage over C++/Java.
+1. **Cache-padded `Sequence`** — `#[repr(align(128))]` isolates each atomic counter from false sharing. Uses 128-byte alignment (not 64) to defeat Intel's Spatial Prefetcher and aarch64 big-core 128-byte cache lines.
 
-2. **Single-producer is 5-20x faster** — No atomic contention. Use it when possible.
+2. **RAII prevents bugs** — Rust's Drop trait makes "forgot to publish" impossible. This is a significant advantage over C++/Java.
 
-3. **Caching is critical** — Cached gating sequence makes consumer checks 10x faster.
+3. **Single-producer is 5-20x faster** — No atomic contention. Use it when possible.
 
-4. **Avoid hot-path allocations** — Use enum dispatch instead of `Box<dyn FnOnce>`. `Arc::clone` (~5ns) is acceptable for soundness; `Box` allocation (~20-50ns) is not.
+4. **Caching is critical** — Cached gating sequence makes consumer checks 10x faster.
 
-5. **`!Sync` enforces single-producer** — Rust's type system prevents accidentally sharing a `SingleProducerSequencer` across threads.
+5. **Avoid hot-path allocations** — Use enum dispatch instead of `Box<dyn FnOnce>`. `Arc::clone` (~5ns) is acceptable for soundness; `Box` allocation (~20-50ns) is not.
 
-6. **Multi-producer cursor ≠ published** — In multi-producer mode, consumers must check `available_buffer`, not just `cursor`.
+6. **Cursor publish before spin-wait** — `set_volatile(current - 1)` ensures consumers can see published data while the producer is waiting for them. Without this, livelock is possible.
+
+7. **Progressive backoff in spin-wait** — spin → yield → sleep(1ns) instead of pure busy-spin. The producer waiting for consumers should yield CPU, not burn it.
+
+8. **`!Sync` enforces single-producer** — Rust's type system prevents accidentally sharing a `SingleProducerSequencer` across threads.
+
+9. **Multi-producer cursor ≠ published** — In multi-producer mode, consumers must check `available_buffer`, not just `cursor`.
 
 ---
 
