@@ -1,20 +1,6 @@
-//! # Sequencers — Coordinate producer access to the ring buffer.
-//!
-//! Sequencers claim slots in the ring buffer and publish sequences to make
-//! events visible to consumers. Two variants:
-//!
-//! - **`SingleProducerSequencer`**: Simple counter, no atomics in the fast path.
-//!   Optimal when only one thread publishes.
-//! - **`MultiProducerSequencer`**: Uses `AtomicI64` with CAS for concurrent producers.
-//!   Covered in depth in Post 9.
-//!
-//! Both use RAII `SequenceClaim` guards that auto-publish on drop, preventing
-//! forgotten publishes.
-//!
-//! ## References
-//! - Blog: Post 3 (single-producer sequencer + RAII), Post 9 (multi-producer CAS)
-//! - Mastery Plan: `disruptor::sequence_barrier` (gating sequences)
-//! - LMAX: `com.lmax.disruptor.SingleProducerSequencer`, `MultiProducerSequencer`
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::thread::current;
 
 pub trait Sequencer: Send {
     /// Claim `count` slots. Blocks until available.
@@ -30,4 +16,52 @@ pub trait Sequencer: Send {
 #[derive(Debug, Clone, Copy)]
 pub struct InsufficientCapacity;
 
-pub struct SequenceClaim {}
+pub struct SequenceClaim {
+    start: i64,
+    end: i64,
+    publish_strategy: PublishStrategy,
+}
+
+enum PublishStrategy {
+    Cursor {
+        cursor: Arc<AtomicI64>,
+    },
+    AvailableBuffer {
+        available_buffer: Arc<[AtomicI32]>,
+        index_mask: usize,
+        buffer_size: usize,
+    },
+}
+
+impl SequenceClaim {
+    pub fn start(&self) -> i64 {
+        self.start
+    }
+
+    pub fn end(&self) -> i64 {
+        self.end
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = i64> {
+        self.start..=self.end
+    }
+}
+
+impl Drop for SequenceClaim {
+    fn drop(&mut self) {
+        match (&self.publish_strategy) {
+            PublishStrategy::Cursor { cursor } => cursor.store(self.end, Ordering::Release),
+            PublishStrategy::AvailableBuffer {
+                available_buffer,
+                index_mask,
+                buffer_size,
+            } => {
+                for seq in self.start..=self.end {
+                    let i = seq as usize & index_mask;
+                    let lap = (seq / *buffer_size as i64) as i32;
+                    available_buffer[i].store(lap, Ordering::Release);
+                }
+            }
+        }
+    }
+}
