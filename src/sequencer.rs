@@ -1,6 +1,6 @@
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
-use std::thread::current;
 
 pub trait Sequencer: Send {
     /// Claim `count` slots. Blocks until available.
@@ -63,5 +63,53 @@ impl Drop for SequenceClaim {
                 }
             }
         }
+    }
+}
+
+pub struct SingleProducerSequencer {
+    cursor: Arc<AtomicI64>,
+    next_sequence: Cell<i64>,
+    buffer_size: usize,
+    gating_sequences: Vec<Arc<AtomicI64>>,
+    cached_gating_sequences: AtomicI64,
+}
+
+impl SingleProducerSequencer {
+    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<AtomicI64>>) -> Self {
+        Self {
+            cursor: Arc::new(AtomicI64::new(-1)),
+            next_sequence: Cell::new(0),
+            buffer_size,
+            gating_sequences,
+            cached_gating_sequences: AtomicI64::new(-1),
+        }
+    }
+
+    pub fn cursor_arc(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.cursor)
+    }
+
+    fn get_minimum_sequence(&self) -> i64 {
+        let mut min = i64::MAX;
+        for seq in &self.gating_sequences {
+            let value = seq.load(Ordering::Acquire);
+            min = min.min(value);
+        }
+        self.cached_gating_sequences.store(min, Ordering::Relaxed);
+        min
+    }
+}
+
+impl Sequencer for SingleProducerSequencer {
+    fn claim(&self, count: usize) -> SequenceClaim {
+        todo!()
+    }
+
+    fn try_claim(&self, count: usize) -> Result<SequenceClaim, InsufficientCapacity> {
+        todo!()
+    }
+
+    fn cursor(&self) -> i64 {
+        todo!()
     }
 }
