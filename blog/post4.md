@@ -920,6 +920,37 @@ wait_strategy.signal_all_when_blocking();
 
 ---
 
+## Wait Strategies Are Consumer-Side Only
+
+A common source of confusion: **wait strategies control how *consumers* wait for new data, not how *producers* wait for space.**
+
+When the ring buffer is full (backpressure), the producer must wait for consumers to advance. This is a separate mechanism:
+
+```rust
+// Producer backpressure wait (inside SingleProducerSequencer::claim / MultiProducerSequencer::claim):
+while self.get_minimum_sequence() < wrap_point {
+    std::thread::park_timeout(std::time::Duration::from_nanos(1));
+}
+```
+
+This matches Java's `LockSupport.parkNanos(1L)` — a self-waking park that yields the CPU briefly and retries. The Java source even has a `// TODO: Use waitStrategy to spin?` comment, meaning LMAX considered using the wait strategy for producer backpressure but decided against it.
+
+**Why not use the wait strategy for producer backpressure?**
+
+1. **Different semantics** — Consumer waiting is "polling for new data" (frequent, short). Producer waiting is "buffer full, consumers are slow" (rare, long). Different situations warrant different strategies.
+2. **No signal source** — For `BlockingWaitStrategy`, consumers would need to call `signal_all_when_blocking()` on the producer's behalf after advancing. But consumers don't know (or care) when the producer is blocked. The producer-consumer relationship is one-directional.
+3. **Simplicity** — `park_timeout(1ns)` is good enough. Producer backpressure is rare in a well-sized buffer. When it does happen, sub-microsecond wakeup precision doesn't matter — the bottleneck is consumer processing speed, not the producer's wake-up latency.
+
+```
+Consumer waiting (wait strategy):     Producer → publishes → Consumer sees data
+Producer backpressure (park_timeout):  Consumer → advances → Producer sees space
+
+These are different flows with different characteristics.
+The wait strategy only governs the first one.
+```
+
+---
+
 ## Testing
 
 Wait strategies interact with shared atomic state across threads, so testing them is essential. We'll write two tests: a **Loom test** for `BlockingWaitStrategy` to exhaustively verify the race condition fix under all interleavings, and a **unit test** for `TimeoutBlockingWaitStrategy` to verify timeout behavior.

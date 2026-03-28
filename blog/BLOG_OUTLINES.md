@@ -20,7 +20,7 @@ Systematic comparison against the original Java Disruptor source code (`Sequence
 
 3. ✅ **Post 3 - Cursor Publish Before Spin-Wait (MEDIUM)**: `SingleProducerSequencer::claim()` must publish the current cursor position before spinning for consumers. Java's `next()` calls `cursor.setVolatile(nextValue)` before `getMinimumSequence()` so consumers can see the latest published events and make progress. Without this, the producer can livelock under backpressure. Note: Post 3B (`post3b.md`) already had this fix (`cursor.store(current - 1, Ordering::SeqCst)`), but the `BLOG_OUTLINES.md` outline and `src/sequencer.rs` did not — both updated for consistency.
 
-4. ✅ **Post 3 - Producer Spin-Wait Backoff (MEDIUM)**: The producer's wait-for-consumers loop used `std::hint::spin_loop()` (pure busy-spin). Java uses `LockSupport.parkNanos(1L)` — a deliberate choice because the *producer* waiting for *consumers* should yield CPU to let those consumers make progress. Replaced with progressive backoff: spin → yield → `thread::sleep(1ns)`.
+4. ✅ **Post 3 - Producer Spin-Wait Backoff (MEDIUM)**: The producer's wait-for-consumers loop used `std::hint::spin_loop()` (pure busy-spin). Java uses `LockSupport.parkNanos(1L)` — a self-waking park that yields CPU so consumers can make progress. Replaced with `std::thread::park_timeout(Duration::from_nanos(1))`, the direct Rust equivalent. Note: Java even has a `// TODO: Use waitStrategy to spin?` comment — they considered but decided against using the consumer wait strategy for producer backpressure. The producer always parks.
 
 5. ✅ **Post 4 - `signal_all_when_blocking` Wiring (LOW-MEDIUM)**: `SequenceClaim::drop()` published events but never called `wait_strategy.signal_all_when_blocking()`. Consumers using `BlockingWaitStrategy` (condvar) would hang indefinitely after events were published. Java's `publish()` always calls `waitStrategy.signalAllWhenBlocking()`. Fixed by passing an optional `Arc<dyn WaitStrategy>` into the `PublishStrategy` enum.
 
@@ -279,7 +279,7 @@ mod tests {
 - `MultiProducerSequencer`: AtomicI64 with CAS
 - **RAII pattern**: `SequenceClaim` auto-publishes on drop
 - **Cursor publish before spin-wait**: `set_volatile(current - 1)` prevents livelock under backpressure
-- **Progressive backoff**: spin → yield → sleep(1ns) in producer wait loop (matches Java's `LockSupport.parkNanos(1L)`)
+- **Producer backpressure**: `park_timeout(1ns)` in producer wait loop (matches Java's `LockSupport.parkNanos(1L)` — self-waking park, no unpark needed)
 
 **Implementation in Rust:**
 ```rust
@@ -413,10 +413,12 @@ impl Sequencer for SingleProducerSequencer {
         let current = self.cursor.load(Ordering::Relaxed); // No contention!
         let next = current + count as i64;
 
-        // Spin until consumers have consumed far enough to free these slots.
+        // Wait until consumers have consumed far enough to free these slots.
+        // park_timeout matches Java's LockSupport.parkNanos(1L) — yields CPU
+        // instead of busy-spinning while waiting for slow consumers.
         let wrap_point = next - self.buffer_size as i64;
         while self.get_minimum_sequence() < wrap_point {
-            std::hint::spin_loop();
+            std::thread::park_timeout(std::time::Duration::from_nanos(1));
         }
 
         // Zero-allocation: store the Arc directly in the enum variant.
@@ -515,7 +517,9 @@ impl Sequencer for MultiProducerSequencer {
             let wrap_point = next - self.buffer_size as i64;
 
             if self.get_minimum_sequence() < wrap_point {
-                std::hint::spin_loop();
+                // Backpressure: buffer full, wait for consumers.
+                // park_timeout matches Java's LockSupport.parkNanos(1L).
+                std::thread::park_timeout(std::time::Duration::from_nanos(1));
                 continue;
             }
 
@@ -1943,9 +1947,10 @@ impl Sequencer for MultiProducerSequencer {
             let current = self.cursor.load(Ordering::Acquire);
             let next = current + count as i64;
 
-            // Check if we have capacity
+            // Check if we have capacity (backpressure)
             if !self.has_available_capacity(count) {
-                std::hint::spin_loop();
+                // Buffer full — park instead of spin (matches Java's LockSupport.parkNanos(1L))
+                std::thread::park_timeout(std::time::Duration::from_nanos(1));
                 continue;
             }
 

@@ -219,7 +219,10 @@ impl Sequencer for MultiProducerSequencer {
             // Check capacity before attempting CAS.
             // This avoids wasting a CAS on a full buffer.
             if !self.has_available_capacity(count) {
-                std::hint::spin_loop();
+                // Backpressure: buffer full, wait for consumers.
+                // park_timeout matches Java's LockSupport.parkNanos(1L) —
+                // yields CPU instead of busy-spinning.
+                std::thread::park_timeout(std::time::Duration::from_nanos(1));
                 continue;
             }
 

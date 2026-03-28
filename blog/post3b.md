@@ -125,7 +125,8 @@ impl SingleProducerSequencer {
         let next = current + count as i64;
         let wrap_point = next - 1 - self.buffer_size as i64;
 
-        // Wait for all consumers to pass wrap_point
+        // Wait for all consumers to pass wrap_point.
+        // (We'll replace spin_loop with park_timeout in the final version.)
         while self.get_minimum_sequence() < wrap_point {
             std::hint::spin_loop();
         }
@@ -159,7 +160,7 @@ pub struct SingleProducerSequencer {
     next_sequence: Cell<i64>,
     buffer_size: usize,
     gating_sequences: Vec<Arc<AtomicI64>>,
-    cached_gating_sequence: AtomicI64,  // Cache!
+    cached_gating_sequence: Cell<i64>,  // Cache! Cell — only producer reads/writes this
 }
 
 impl SingleProducerSequencer {
@@ -169,18 +170,19 @@ impl SingleProducerSequencer {
         let wrap_point = next - 1 - self.buffer_size as i64;
 
         // Check cache first (fast path — no atomic loads of consumer positions!)
-        let cached = self.cached_gating_sequence.load(Ordering::Relaxed);
+        let cached = self.cached_gating_sequence.get();
         if wrap_point > cached || cached > current {
             // Cache is stale — recompute minimum.
             // The `cached > current` check handles sequence wrap-around:
             // if cached is ahead of where we are, the cache is invalid.
             let mut min = self.get_minimum_sequence();
-            self.cached_gating_sequence.store(min, Ordering::Relaxed);
+            self.cached_gating_sequence.set(min);
 
+            // (We'll replace spin_loop with park_timeout in the final version.)
             while min < wrap_point {
                 std::hint::spin_loop();
                 min = self.get_minimum_sequence();
-                self.cached_gating_sequence.store(min, Ordering::Relaxed);
+                self.cached_gating_sequence.set(min);
             }
         }
 
@@ -558,26 +560,22 @@ impl Sequencer for SingleProducerSequencer {
             // Cost: ~20-30 cycles on x86, ~50-100 cycles on ARM. Only on cache miss.
             self.cursor.set_volatile(current - 1);
 
-            // Progressive backoff while waiting for consumers.
+            // Yield CPU while waiting for consumers, matching Java's
+            // LockSupport.parkNanos(1L).
             //
-            // Java uses LockSupport.parkNanos(1L) here — NOT a busy-spin.
-            // The reasoning: the *producer* is waiting for *consumers* to advance.
-            // Burning 100% CPU on spin_loop() can actually slow consumers down
-            // (via thermal throttling, power-state transitions, or starving
-            // consumer threads on the same physical core with HyperThreading).
+            // Why not busy-spin? The producer is waiting for *consumers* to
+            // advance — this is backpressure, not a short wait for new data.
+            // Spinning here:
+            // - Starves consumer threads on the same physical core (HyperThreading)
+            // - Causes thermal throttling under sustained load
+            // - Wastes power for no benefit (consumers need μs, not ns)
             //
-            // Our backoff: spin (100 iterations) → yield → sleep(1ns).
-            let mut spin_count = 0u32;
+            // Java's LockSupport.parkNanos(1L) is a "self-waking park" — it
+            // suspends the thread briefly and wakes on timeout. Nobody calls
+            // unpark() on the producer; the 1ns timeout is the sole wakeup
+            // mechanism. Rust's park_timeout is the direct equivalent.
             while self.get_minimum_sequence() < wrap_point {
-                if spin_count < 100 {
-                    std::hint::spin_loop();
-                    spin_count += 1;
-                } else if spin_count < 200 {
-                    std::thread::yield_now();
-                    spin_count += 1;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_nanos(1));
-                }
+                std::thread::park_timeout(std::time::Duration::from_nanos(1));
             }
         }
 
@@ -631,7 +629,7 @@ impl Sequencer for SingleProducerSequencer {
 2. **No atomic in claim** — `Cell<i64>` for both `next_sequence` and `cached_gating_sequence` (single producer only, `!Sync` enforced by Cell)
 3. **Cached gating sequence** — Avoids iterating consumers on every claim
 4. **Cursor publish before spin-wait** — `set_volatile(current - 1)` makes cursor visible to consumers before we read their positions, preventing livelock
-5. **Progressive backoff** — spin → yield → sleep(1ns), matching Java's `LockSupport.parkNanos(1L)` instead of burning CPU on pure busy-spin
+5. **`park_timeout(1ns)` for backpressure** — matching Java's `LockSupport.parkNanos(1L)`. The producer yields CPU while waiting for slow consumers instead of burning cycles on a busy-spin
 6. **`Arc::clone` in PublishStrategy** — Guarantees soundness (claim holds a strong reference, preventing use-after-free)
 7. **Release on publish** — `Sequence::set()` uses `Ordering::Release`, making event data visible to consumers
 
@@ -752,18 +750,11 @@ impl Sequencer for MultiProducerSequencer {
             // Note: Unlike SingleProducer, no separate StoreLoad fence needed.
             // fetch_add with AcqRel already updated the cursor atomically.
             //
-            // Progressive backoff (same rationale as SingleProducer):
-            let mut spin_count = 0u32;
+            // Park while waiting, same rationale as SingleProducer:
+            // we're waiting on slow consumers, not short-lived data.
+            // See SingleProducerSequencer::claim() for full explanation.
             while self.get_minimum_sequence() < wrap_point {
-                if spin_count < 100 {
-                    std::hint::spin_loop();
-                    spin_count += 1;
-                } else if spin_count < 200 {
-                    std::thread::yield_now();
-                    spin_count += 1;
-                } else {
-                    std::thread::sleep(std::time::Duration::from_nanos(1));
-                }
+                std::thread::park_timeout(std::time::Duration::from_nanos(1));
             }
         }
 
@@ -859,7 +850,7 @@ We use `fetch_add` for `claim()` (always succeeds) and CAS loop only for `try_cl
 
 6. **Cursor publish before spin-wait** — `set_volatile(current - 1)` ensures consumers can see published data while the producer is waiting for them. Without this, livelock is possible.
 
-7. **Progressive backoff in spin-wait** — spin → yield → sleep(1ns) instead of pure busy-spin. The producer waiting for consumers should yield CPU, not burn it.
+7. **`park_timeout(1ns)` in producer backpressure wait** — matching Java's `LockSupport.parkNanos(1L)`. The producer yields CPU instead of busy-spinning while waiting for consumers. Note: this is separate from consumer wait strategies (Part 4) — the producer always parks, regardless of which wait strategy consumers use.
 
 8. **`!Sync` enforces single-producer** — Rust's type system prevents accidentally sharing a `SingleProducerSequencer` across threads.
 
