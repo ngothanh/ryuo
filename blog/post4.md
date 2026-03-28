@@ -91,6 +91,29 @@ pub struct SequenceBarrier {
     dependent_sequences: Vec<Arc<AtomicI64>>,
 }
 
+// **Design note: `Box<dyn WaitStrategy>` vs enum dispatch**
+//
+// We use `Box<dyn WaitStrategy>` here for pedagogical clarity and
+// extensibility — users can define custom wait strategies without
+// modifying Ryuo's source. However, this incurs a vtable indirection
+// on every `wait_for()` call (~2-5ns + prevents inlining).
+//
+// For maximum performance, you can replace this with an enum:
+//
+//   enum WaitStrategyImpl {
+//       BusySpin(BusySpinWaitStrategy),
+//       Yielding(YieldingWaitStrategy),
+//       Blocking(BlockingWaitStrategy),
+//   }
+//
+// Enum dispatch is zero-cost (compiler inlines through the match) but
+// closed — adding a strategy requires modifying the enum. Alternatively,
+// make `SequenceBarrier` generic: `SequenceBarrier<W: WaitStrategy>`.
+//
+// In practice, the 2-5ns vtable cost is negligible relative to the
+// wait strategy's own cost (50ns-10μs), so `Box<dyn>` is acceptable
+// for most systems. Profile before optimizing.
+
 impl SequenceBarrier {
     pub fn new(
         cursor: Arc<AtomicI64>,

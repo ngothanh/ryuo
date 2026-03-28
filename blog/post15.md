@@ -133,9 +133,15 @@ pub fn calibrate_tsc_ns() -> f64 {
 }
 
 /// Portable timer: uses RDTSC on x86_64, Instant::now() elsewhere.
+///
+/// On non-x86_64 (ARM64, etc.), timestamps are nanoseconds elapsed
+/// since the Timer was created. On x86_64, timestamps are raw TSC
+/// ticks, converted to nanoseconds via `tsc_to_ns()`.
 pub struct Timer {
     #[cfg(target_arch = "x86_64")]
     tsc_per_ns: f64,
+    #[cfg(not(target_arch = "x86_64"))]
+    epoch: std::time::Instant,
 }
 
 impl Timer {
@@ -143,6 +149,8 @@ impl Timer {
         Self {
             #[cfg(target_arch = "x86_64")]
             tsc_per_ns: calibrate_tsc_ns(),
+            #[cfg(not(target_arch = "x86_64"))]
+            epoch: std::time::Instant::now(),
         }
     }
 
@@ -152,7 +160,7 @@ impl Timer {
         #[cfg(target_arch = "x86_64")]
         { rdtsc() }
         #[cfg(not(target_arch = "x86_64"))]
-        { std::time::Instant::now().elapsed().as_nanos() as u64 }
+        { self.epoch.elapsed().as_nanos() as u64 }
     }
 
     /// Record a receive timestamp (serializing on x86_64).
@@ -161,7 +169,7 @@ impl Timer {
         #[cfg(target_arch = "x86_64")]
         { rdtscp() }
         #[cfg(not(target_arch = "x86_64"))]
-        { std::time::Instant::now().elapsed().as_nanos() as u64 }
+        { self.epoch.elapsed().as_nanos() as u64 }
     }
 
     /// Convert a TSC delta to nanoseconds.
@@ -170,7 +178,7 @@ impl Timer {
         #[cfg(target_arch = "x86_64")]
         { (tsc_delta as f64 / self.tsc_per_ns) as u64 }
         #[cfg(not(target_arch = "x86_64"))]
-        { tsc_delta }
+        { tsc_delta } // already in nanoseconds
     }
 }
 ```

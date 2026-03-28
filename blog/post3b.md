@@ -324,6 +324,14 @@ impl Sequence {
             .is_ok()
     }
 
+    /// Atomic fetch-and-add — only needed for multi-producer claiming.
+    /// Returns the previous value. Uses AcqRel: acquire prior publishes,
+    /// release our cursor advance.
+    #[inline]
+    pub fn fetch_add(&self, n: i64, ordering: Ordering) -> i64 {
+        self.value.fetch_add(n, ordering)
+    }
+
     /// Relaxed load — only safe when the caller is the sole writer
     /// (e.g., SingleProducerSequencer reading its own cursor).
     #[inline]
@@ -383,7 +391,11 @@ pub trait Sequencer: Send {
 #[derive(Debug, Clone, Copy)]
 pub struct InsufficientCapacity;
 
-/// RAII guard that automatically publishes on drop
+/// RAII guard that automatically publishes on drop.
+///
+/// Dropping without writing event data publishes stale/uninitialized bytes —
+/// `#[must_use]` ensures the compiler warns if a claim is silently dropped.
+#[must_use = "dropping a SequenceClaim without writing event data publishes stale bytes"]
 pub struct SequenceClaim {
     start: i64,
     end: i64,
@@ -405,12 +417,14 @@ enum PublishStrategy {
     /// Single-producer: just store to the cursor
     Cursor {
         cursor: Arc<Sequence>,
+        wait_strategy: Arc<dyn WaitStrategy>,  // See Part 4
     },
     /// Multi-producer: mark individual slots in the available buffer
     AvailableBuffer {
         available_buffer: Arc<[AtomicI32]>,
         index_mask: usize,
         buffer_size: usize,
+        wait_strategy: Arc<dyn WaitStrategy>,  // See Part 4
     },
 }
 
@@ -427,32 +441,29 @@ impl SequenceClaim {
 impl Drop for SequenceClaim {
     fn drop(&mut self) {
         match &self.strategy {
-            PublishStrategy::Cursor { cursor } => {
+            PublishStrategy::Cursor { cursor, wait_strategy } => {
                 // Release store: makes all event data written since claim()
                 // visible to consumers who Acquire-load this cursor.
                 cursor.set(self.end);
+                // Wake consumers using BlockingWaitStrategy (condvar).
+                // For BusySpin/Yielding/Sleeping, this is a no-op.
+                wait_strategy.signal_all_when_blocking();
             }
-            PublishStrategy::AvailableBuffer { available_buffer, index_mask, buffer_size } => {
+            PublishStrategy::AvailableBuffer {
+                available_buffer, index_mask, buffer_size, wait_strategy,
+            } => {
                 for seq in self.start..=self.end {
                     let index = (seq as usize) & index_mask;
                     let lap = (seq / *buffer_size as i64) as i32;
                     available_buffer[index].store(lap, Ordering::Release);
                 }
+                wait_strategy.signal_all_when_blocking();
             }
         }
-
-        // Wake consumers using BlockingWaitStrategy (condvar).
-        //
         // Java's publish() always calls waitStrategy.signalAllWhenBlocking().
         // Without this, consumers sleeping in condvar.wait() would never
-        // wake up after new events are published.
-        //
-        // For BusySpin/Yielding/Sleeping wait strategies, this is a no-op
-        // (the method body is empty), so it costs nothing.
-        //
-        // The wait_strategy reference is stored in the sequencer and passed
-        // into the SequenceClaim at construction time. We omit it from this
-        // code listing for clarity — see Part 4 for the full wiring.
+        // wake up after new events are published. See Part 4 for the full
+        // WaitStrategy trait definition.
     }
 }
 ```
@@ -495,15 +506,24 @@ pub struct SingleProducerSequencer {
     buffer_size: usize,
     gating_sequences: Vec<Arc<Sequence>>,   // Consumer positions
     cached_gating_sequence: Cell<i64>,      // Cached minimum (producer-only, no atomic needed)
+    wait_strategy: Arc<dyn WaitStrategy>,   // Passed into SequenceClaim for signal on publish
 }
 
 // SingleProducerSequencer is Send (can be moved to the producer thread)
 // but NOT Sync (must not be shared across threads — only one producer).
 // Cell<i64> already makes it !Sync automatically — the compiler will reject
 // any attempt to share this struct via Arc or similar.
+//
+// Note: Code examples in Posts 4–16 may omit the `wait_strategy` parameter
+// for brevity, showing `::new(buffer_size, gating_sequences)`. The full
+// production constructor requires all three parameters as shown here.
 
 impl SingleProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<Sequence>>) -> Self {
+    pub fn new(
+        buffer_size: usize,
+        gating_sequences: Vec<Arc<Sequence>>,
+        wait_strategy: Arc<dyn WaitStrategy>,
+    ) -> Self {
         assert!(buffer_size.is_power_of_two(), "buffer_size must be power of 2");
         Self {
             cursor: Arc::new(Sequence::new(-1)),  // Start at -1 so first sequence is 0
@@ -511,6 +531,7 @@ impl SingleProducerSequencer {
             buffer_size,
             gating_sequences,
             cached_gating_sequence: Cell::new(-1), // Cell — only producer reads/writes this
+            wait_strategy,
         }
     }
 
@@ -586,6 +607,7 @@ impl Sequencer for SingleProducerSequencer {
             end: next - 1,
             strategy: PublishStrategy::Cursor {
                 cursor: Arc::clone(&self.cursor),
+                wait_strategy: Arc::clone(&self.wait_strategy),
             },
         }
     }
@@ -613,6 +635,7 @@ impl Sequencer for SingleProducerSequencer {
             end: next - 1,
             strategy: PublishStrategy::Cursor {
                 cursor: Arc::clone(&self.cursor),
+                wait_strategy: Arc::clone(&self.wait_strategy),
             },
         })
     }
@@ -692,6 +715,7 @@ pub struct MultiProducerSequencer {
     gating_sequences: Vec<Arc<Sequence>>,   // Consumer positions (each padded!)
     cached_gating_sequence: AtomicI64,      // Shared across producer threads — must be atomic
     available_buffer: Arc<[AtomicI32]>,     // Tracks which sequences are published
+    wait_strategy: Arc<dyn WaitStrategy>,   // Passed into SequenceClaim for signal on publish
 }
 
 // MultiProducerSequencer IS Sync — multiple producers can call claim() concurrently.
@@ -703,7 +727,11 @@ pub struct MultiProducerSequencer {
 // one thread ever touches the cache, here any producer thread can update it.
 
 impl MultiProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<Sequence>>) -> Self {
+    pub fn new(
+        buffer_size: usize,
+        gating_sequences: Vec<Arc<Sequence>>,
+        wait_strategy: Arc<dyn WaitStrategy>,
+    ) -> Self {
         assert!(buffer_size.is_power_of_two(), "buffer_size must be power of 2");
 
         let available_buffer: Arc<[AtomicI32]> = (0..buffer_size)
@@ -717,6 +745,7 @@ impl MultiProducerSequencer {
             gating_sequences,
             cached_gating_sequence: AtomicI64::new(-1),
             available_buffer,
+            wait_strategy,
         }
     }
 
@@ -737,10 +766,7 @@ impl Sequencer for MultiProducerSequencer {
         // Atomically claim sequence range (always succeeds, no retry!).
         // fetch_add returns the OLD cursor value. Since cursor starts at -1,
         // the first claimed sequence is current + 1 = 0.
-        //
-        // We access cursor.value directly here because Sequence's public API
-        // doesn't expose fetch_add — it's only needed in MultiProducerSequencer.
-        let current = self.cursor.value.fetch_add(count as i64, Ordering::AcqRel);
+        let current = self.cursor.fetch_add(count as i64, Ordering::AcqRel);
         let end = current + count as i64;  // = new cursor value
 
         let wrap_point = end - self.buffer_size as i64;
@@ -765,6 +791,7 @@ impl Sequencer for MultiProducerSequencer {
                 available_buffer: Arc::clone(&self.available_buffer),
                 index_mask: self.index_mask,
                 buffer_size: self.buffer_size,
+                wait_strategy: Arc::clone(&self.wait_strategy),
             },
         }
     }
@@ -793,6 +820,7 @@ impl Sequencer for MultiProducerSequencer {
                         available_buffer: Arc::clone(&self.available_buffer),
                         index_mask: self.index_mask,
                         buffer_size: self.buffer_size,
+                        wait_strategy: Arc::clone(&self.wait_strategy),
                     },
                 });
             }
@@ -840,7 +868,7 @@ We use `fetch_add` for `claim()` (always succeeds) and CAS loop only for `try_cl
 
 1. **Cache-padded `Sequence`** — `#[repr(align(128))]` isolates each atomic counter from false sharing. Uses 128-byte alignment (not 64) to defeat Intel's Spatial Prefetcher and aarch64 big-core 128-byte cache lines.
 
-2. **RAII prevents bugs** — Rust's Drop trait makes "forgot to publish" impossible. This is a significant advantage over C++/Java.
+2. **RAII prevents bugs** — Rust's Drop trait makes "forgot to publish" impossible. `#[must_use]` on `SequenceClaim` adds a compiler warning when a claim is dropped without writing data (which would publish stale bytes). This is a significant advantage over C++/Java.
 
 3. **Single-producer is 5-20x faster** — No atomic contention. Use it when possible.
 

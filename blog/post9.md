@@ -78,6 +78,8 @@ Producer B: load cursor=7, check capacity... wrap_point=4 > consumer=2
 
 ## Implementation
 
+> **Note on types:** This post uses `Arc<AtomicI64>` in code listings for clarity — showing the raw atomic operations without abstraction layers. In the production implementation (Part 3B), all sequence counters use the cache-padded `Sequence` type (`#[repr(align(128))]`) wrapped in `Arc<Sequence>`. The `Sequence` type provides `get()` (Acquire load), `set()` (Release store), and `compare_and_set()` methods. When integrating with the rest of Ryuo, replace `Arc<AtomicI64>` with `Arc<Sequence>` and use the `Sequence` methods instead of direct `load`/`store` calls.
+
 ### Step 1: Data Structure
 
 ```rust
@@ -114,8 +116,24 @@ pub struct MultiProducerSequencer {
     /// Buffer size (must be power of 2).
     buffer_size: usize,
 
+    /// Bitmask for fast modulo: `sequence & index_mask` == `sequence % buffer_size`.
+    index_mask: usize,
 
-A boolean only stores "written" or "not written." After the ring buffer wraps, *every* slot has been written — so a boolean can't distinguish between "written in this lap" and "written in the previous lap." The lap number solves this: if `available_buffer[3] == 2`, slot 3 was published on lap 2. A consumer expecting lap 3 sees `2 != 3` and knows the slot isn't ready yet.
+    /// Per-slot availability flags.
+    ///
+    /// Each entry stores a "lap number" (how many times the ring buffer
+    /// has wrapped past this slot). This is more subtle than a boolean —
+    /// a boolean only stores "written" or "not written." After the ring
+    /// buffer wraps, *every* slot has been written — so a boolean can't
+    /// distinguish between "written in this lap" and "written in the
+    /// previous lap." The lap number solves this: if `available_buffer[3] == 2`,
+    /// slot 3 was published on lap 2. A consumer expecting lap 3 sees
+    /// `2 != 3` and knows the slot isn't ready yet.
+    available_buffer: Vec<AtomicI32>,
+}
+```
+
+**Why `-1` initialization works:** The first sequence published is 0, which maps to lap `0 / buffer_size = 0`. Since all slots are initialized to `-1`, no slot appears published until explicitly set. Sequences always start at 0 (cursor begins at -1, and `claim()` returns `[current+1, next]`), so lap 0 is always the first valid lap.
 
 ```
 Lap-based availability:
@@ -416,6 +434,15 @@ N=16: 10+ retries per success     → ~80% CAS failures
 ```
 
 Each failed CAS wastes ~10-20ns (load + compare + fail + hint::spin_loop). At 80% failure rate with 16 producers, the average claim takes 5-10× longer than uncontended.
+
+### Fairness Warning
+
+CAS-based claiming is **not fair**. Under high contention, a slow producer (one that gets preempted or stalls between the load and CAS) can be starved indefinitely because faster producers keep winning the race. The LMAX Java Disruptor accepts this tradeoff — in practice, with pinned threads and dedicated cores, starvation is rare.
+
+If fairness is critical (e.g., multiple producers with hard latency SLAs), consider:
+- **Partitioning producers** to separate single-producer rings (sharding, see below)
+- **Ticket-based claiming** using `fetch_add` with a separate capacity semaphore
+- **Reducing producer count** to ≤4, where CAS failure rates stay manageable (~30%)
 
 ### Benchmark Data
 

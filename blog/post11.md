@@ -597,7 +597,7 @@ fn fixed_group_matches_dynamic_group_results() {
 
 5. **`HandlerHandle` must be explicitly removed.** Dropping without removal leaves a dangling gating sequence that will deadlock the producer. The `Drop` impl warns but can't fix this.
 
-6. **`RwLock` is sufficient for most systems.** Only upgrade to lock-free (epoch-based) if profiling shows RwLock contention on the read path — which requires >8 producers with frequent gating checks.
+6. **`RwLock` is sufficient for most systems.** `RwLock::read()` costs ~15-25ns uncontended; `RwLock::write()` costs ~50-200ns under contention. At 10M events/sec, the read-side overhead adds ~150-250ms per second compared to `FixedSequenceGroup`. Only upgrade to lock-free (epoch-based reclamation or RCU-style atomic pointer swap) if profiling shows RwLock contention on the read path — which requires >8 producers with frequent gating checks. An epoch-based approach would eliminate the read-side lock entirely: swap the sequence list via an atomic pointer, and reclaim the old list after all readers have crossed an epoch boundary.
 
 ---
 

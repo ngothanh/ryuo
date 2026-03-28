@@ -20,24 +20,28 @@ Now let's see how to use them, test them, and understand their performance chara
 
 ## Usage Examples
 
+> **Note on types:** These examples use the cache-padded `Sequence` type from Part 3B for all sequence counters. Consumer sequences use `Arc<Sequence>` (not `Arc<AtomicI64>`) to prevent false sharing. The `Sequence` type provides `get()`, `set()`, and `set_volatile()` methods that wrap `AtomicI64` with the correct memory orderings. See Part 3B for the full definition.
+
 ### **Example 1: Single Producer, Single Consumer**
 
 ```rust
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
 
 // Create ring buffer (shared between producer and consumer)
 let ring_buffer = Arc::new(RingBuffer::new(1024));
 
 // Create consumer sequence (tracks consumer position)
-let consumer_seq = Arc::new(AtomicI64::new(-1));
+let consumer_seq = Arc::new(Sequence::new(-1));
 
 // Create sequencer with consumer as gating sequence
-let sequencer = SingleProducerSequencer::new(1024, vec![Arc::clone(&consumer_seq)]);
+let wait_strategy: Arc<dyn WaitStrategy> = Arc::new(BusySpinWaitStrategy);
+let sequencer = SingleProducerSequencer::new(
+    1024, vec![Arc::clone(&consumer_seq)], Arc::clone(&wait_strategy),
+);
 
 // Get a cursor handle for the consumer BEFORE moving sequencer to producer.
-// The cursor is an Arc<AtomicI64> inside the sequencer — we clone it so the
+// The cursor is an Arc<Sequence> inside the sequencer — we clone it so the
 // consumer can observe published sequences independently.
 let cursor = sequencer.cursor_arc();
 
@@ -60,14 +64,14 @@ let consumer = thread::spawn(move || {
 
     while next_sequence < 1000 {
         // Wait for sequence to be published
-        while cursor.load(Ordering::Acquire) < next_sequence {
+        while cursor.get() < next_sequence {
             std::hint::spin_loop();
         }
 
         let event = rb_consumer.get(next_sequence);
         println!("Consumed: {}", event.value);
 
-        consumer_seq.store(next_sequence, Ordering::Release);
+        consumer_seq.set(next_sequence);
         next_sequence += 1;
     }
 });
@@ -81,9 +85,12 @@ consumer.join().unwrap();
 ### **Example 2: Multiple Producers, Single Consumer**
 
 ```rust
-let consumer_seq = Arc::new(AtomicI64::new(-1));
+let consumer_seq = Arc::new(Sequence::new(-1));
 let ring_buffer = Arc::new(RingBuffer::new(1024));
-let sequencer = Arc::new(MultiProducerSequencer::new(1024, vec![Arc::clone(&consumer_seq)]));
+let wait_strategy: Arc<dyn WaitStrategy> = Arc::new(BusySpinWaitStrategy);
+let sequencer = Arc::new(MultiProducerSequencer::new(
+    1024, vec![Arc::clone(&consumer_seq)], Arc::clone(&wait_strategy),
+));
 
 let producers: Vec<_> = (0..4).map(|id| {
     let seq = Arc::clone(&sequencer);
@@ -262,7 +269,7 @@ mod tests {
     #[test]
     fn test_wrap_around_prevented_by_gating() {
         loom::model(|| {
-            let consumer_seq = Arc::new(AtomicI64::new(-1)); // consumer hasn't read anything
+            let consumer_seq = Arc::new(Sequence::new(-1)); // consumer hasn't read anything
             let sequencer = Arc::new(MultiProducerSequencer::new(
                 2, vec![Arc::clone(&consumer_seq)]
             ));
@@ -278,7 +285,7 @@ mod tests {
                 "try_claim must fail when buffer is full and consumer hasn't advanced");
 
             // Now simulate consumer advancing past sequence 0
-            consumer_seq.store(0, Ordering::Release);
+            consumer_seq.set(0);
 
             // Drop the first two claims (publishes them)
             drop(claim1);
