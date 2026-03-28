@@ -36,12 +36,11 @@
 pub mod ring_buffer;
 
 // ── Coordination (Post 3, 5) ────────────────────────────────────────────
-pub mod sequencer;
 pub mod sequence_barrier;
 
 // ── Consumer strategies (Post 4, 6) ─────────────────────────────────────
-pub mod wait_strategy;
 pub mod event_handler;
+pub mod wait_strategy;
 
 // ── Publishing (Post 7) ─────────────────────────────────────────────────
 pub mod publisher;
@@ -63,8 +62,8 @@ pub mod dynamic_topology;
 pub mod builder;
 
 // ── Production (Post 14, 15) ────────────────────────────────────────────
-pub mod monitoring;
 pub mod benchmark;
+pub mod monitoring;
 
 // ── Async integration (Post 16) ─────────────────────────────────────────
 pub mod async_bridge;
