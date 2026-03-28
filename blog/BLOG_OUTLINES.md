@@ -291,17 +291,18 @@ use std::sync::Arc;
 /// Using `Box<dyn FnOnce>` was the previous approach; it allocated on **every**
 /// `claim()` call (~50–200 ns per message). This enum stores the exact data each
 /// variant needs inline, making `SequenceClaim` itself zero-allocation.
-enum ClaimAction {
+enum PublishStrategy {
     /// Single producer: advance the cursor to `end` and make all prior writes
     /// visible with a single Release store.
-    SingleProducer { cursor: Arc<AtomicI64> },
+    Cursor { cursor: Arc<Sequence>, wait_strategy: Arc<dyn WaitStrategy> },
     /// Multi-producer: mark every claimed slot in the availability buffer.
     /// `Arc<[AtomicI32]>` is cheap to clone (~1 ns refcount bump vs ~100 ns
     /// for `Vec::clone`). Stored here so the drop impl needs no extra allocation.
-    MultiProducer {
+    AvailableBuffer {
         available_buffer: Arc<[AtomicI32]>,
         index_mask: usize,
         buffer_size: usize,
+        wait_strategy: Arc<dyn WaitStrategy>,
     },
 }
 
@@ -315,7 +316,7 @@ enum ClaimAction {
 pub struct SequenceClaim {
     start: i64,
     end: i64,
-    action: Option<ClaimAction>,
+    action: Option<PublishStrategy>,
 }
 
 impl SequenceClaim {
@@ -332,12 +333,13 @@ impl SequenceClaim {
 impl Drop for SequenceClaim {
     fn drop(&mut self) {
         match self.action.take() {
-            Some(ClaimAction::SingleProducer { cursor }) => {
+            Some(PublishStrategy::Cursor { cursor, wait_strategy }) => {
                 // One Release store advances the cursor and makes all event
                 // data written since the last publish visible to consumers.
                 cursor.store(self.end, Ordering::Release);
+                wait_strategy.signal_all_when_blocking();
             }
-            Some(ClaimAction::MultiProducer { available_buffer, index_mask, buffer_size }) => {
+            Some(PublishStrategy::AvailableBuffer { available_buffer, index_mask, buffer_size, wait_strategy }) => {
                 // Mark each slot available so consumers can read up to the
                 // highest *contiguous* published sequence (see Post 9).
                 for seq in self.start..=self.end {
@@ -345,6 +347,7 @@ impl Drop for SequenceClaim {
                     let flag = (seq / buffer_size as i64) as i32;
                     available_buffer[index].store(flag, Ordering::Release);
                 }
+                wait_strategy.signal_all_when_blocking();
             }
             None => {} // Already published; should not happen.
         }
@@ -366,9 +369,10 @@ pub trait Sequencer: Send + Sync {
 }
 
 pub struct SingleProducerSequencer {
-    cursor: Arc<AtomicI64>,
-    gating_sequences: Vec<Arc<AtomicI64>>,
+    cursor: Arc<Sequence>,
+    gating_sequences: Vec<Arc<Sequence>>,
     buffer_size: usize,
+    wait_strategy: Arc<dyn WaitStrategy>,
     /// Debug-only: thread that constructed this sequencer.
     /// `claim()` asserts we are still on that thread so misuse is caught
     /// at development time — not silently in production.
@@ -377,11 +381,12 @@ pub struct SingleProducerSequencer {
 }
 
 impl SingleProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<AtomicI64>>) -> Self {
+    pub fn new(buffer_size: usize, wait_strategy: Arc<dyn WaitStrategy>, gating_sequences: Vec<Arc<Sequence>>) -> Self {
         Self {
-            cursor: Arc::new(AtomicI64::new(-1)),
+            cursor: Arc::new(Sequence::new(-1)),
             gating_sequences,
             buffer_size,
+            wait_strategy,
             #[cfg(debug_assertions)]
             producer_thread: std::thread::current().id(),
         }
@@ -425,8 +430,9 @@ impl Sequencer for SingleProducerSequencer {
         SequenceClaim {
             start: current + 1,
             end: next,
-            action: Some(ClaimAction::SingleProducer {
+            action: Some(PublishStrategy::Cursor {
                 cursor: Arc::clone(&self.cursor),
+                wait_strategy: Arc::clone(&self.wait_strategy),
             }),
         }
     }
@@ -450,8 +456,9 @@ impl Sequencer for SingleProducerSequencer {
         Ok(SequenceClaim {
             start: current + 1,
             end: next,
-            action: Some(ClaimAction::SingleProducer {
+            action: Some(PublishStrategy::Cursor {
                 cursor: Arc::clone(&self.cursor),
+                wait_strategy: Arc::clone(&self.wait_strategy),
             }),
         })
     }
@@ -466,17 +473,18 @@ impl Sequencer for SingleProducerSequencer {
 }
 
 pub struct MultiProducerSequencer {
-    cursor: Arc<AtomicI64>,
-    gating_sequences: Vec<Arc<AtomicI64>>,
+    cursor: Arc<Sequence>,
+    gating_sequences: Vec<Arc<Sequence>>,
     buffer_size: usize,
     index_mask: usize,
     // Arc<[AtomicI32]> instead of Vec<AtomicI32> for cheap cloning in closures
     // Arc::clone just increments refcount (~1ns), Vec::clone allocates + copies (~100ns)
     available_buffer: Arc<[AtomicI32]>,
+    wait_strategy: Arc<dyn WaitStrategy>,
 }
 
 impl MultiProducerSequencer {
-    pub fn new(buffer_size: usize, gating_sequences: Vec<Arc<AtomicI64>>) -> Self {
+    pub fn new(buffer_size: usize, wait_strategy: Arc<dyn WaitStrategy>, gating_sequences: Vec<Arc<Sequence>>) -> Self {
         assert!(buffer_size.is_power_of_two());
 
         let available_buffer: Arc<[AtomicI32]> = (0..buffer_size)
@@ -485,11 +493,12 @@ impl MultiProducerSequencer {
             .into();
 
         Self {
-            cursor: Arc::new(AtomicI64::new(-1)),
+            cursor: Arc::new(Sequence::new(-1)),
             gating_sequences,
             buffer_size,
             index_mask: buffer_size - 1,
             available_buffer,
+            wait_strategy,
         }
     }
 
@@ -536,10 +545,11 @@ impl Sequencer for MultiProducerSequencer {
                 return SequenceClaim {
                     start: current + 1,
                     end: next,
-                    action: Some(ClaimAction::MultiProducer {
+                    action: Some(PublishStrategy::AvailableBuffer {
                         available_buffer: Arc::clone(&self.available_buffer),
                         index_mask: self.index_mask,
                         buffer_size: self.buffer_size,
+                        wait_strategy: Arc::clone(&self.wait_strategy),
                     }),
                 };
             }
@@ -564,10 +574,11 @@ impl Sequencer for MultiProducerSequencer {
             Ok(_) => Ok(SequenceClaim {
                 start: current + 1,
                 end: next,
-                action: Some(ClaimAction::MultiProducer {
+                action: Some(PublishStrategy::AvailableBuffer {
                     available_buffer: Arc::clone(&self.available_buffer),
                     index_mask: self.index_mask,
                     buffer_size: self.buffer_size,
+                    wait_strategy: Arc::clone(&self.wait_strategy),
                 }),
             }),
             Err(_) => Err(InsufficientCapacity),

@@ -21,6 +21,8 @@ This post answers all three.
 
 ---
 
+> **Note on types:** This post uses `Arc<AtomicI64>` in code listings for clarity. In the production implementation (Part 3B), all sequence counters use the cache-padded `Sequence` type (`#[repr(align(128))]`) wrapped in `Arc<Sequence>`. When integrating, replace `Arc<AtomicI64>` with `Arc<Sequence>` and use `Sequence::get()` / `Sequence::set()` instead of direct `load`/`store` calls.
+
 ## The Coordination Problem
 
 ### Single Consumer: Simple
@@ -124,7 +126,7 @@ First, we need a way for the barrier to ask the sequencer whether a given sequen
 We add two methods to the `Sequencer` trait from Part 3B:
 
 ```rust
-pub trait Sequencer: Send + Sync {
+pub trait Sequencer: Send {
     // ... existing methods from Part 3B ...
 
     /// Check if a specific sequence has been published.
@@ -148,6 +150,11 @@ pub trait Sequencer: Send + Sync {
     /// must check all gating sequences before overwriting ring buffer slots.
     fn add_gating_sequence(&self, sequence: Arc<AtomicI64>);
 }
+// Note: SingleProducerSequencer is !Sync (uses Cell) and cannot be
+// wrapped in Arc. It is moved to the producer thread and used via
+// &self. MultiProducerSequencer is Sync and can be wrapped in Arc.
+// When using dyn Sequencer, wrap MultiProducerSequencer in Arc.
+// SingleProducerSequencer uses a separate code path (owned, not shared).
 ```
 
 **Why two methods?** `is_available` checks a single slot — useful for diagnostic tools and health checks. `get_highest_published_sequence` scans a range — used by the barrier on every `wait_for` call to find contiguous data.

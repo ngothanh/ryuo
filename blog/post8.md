@@ -779,12 +779,13 @@ fn rewind_retries_on_transient_failure() {
     // Setup ring buffer with events 0..4
     let ring_buffer = Arc::new(RingBuffer::<u64>::new(8));
     let sequencer = SingleProducerSequencer::new(8, vec![]);
+    let wait_strategy = Arc::new(BusySpinWaitStrategy);
 
     for i in 0..4u64 {
         ring_buffer.publish_with(&sequencer, |event, _| { *event = i; });
     }
 
-    let barrier = Arc::new(SequenceBarrier::from_sequencer(&sequencer, vec![]));
+    let barrier = Arc::new(SequenceBarrier::from_sequencer(&sequencer, &wait_strategy, vec![]));
     let handler = FlakeyHandler {
         fail_count: Cell::new(0),
         calls: vec![],

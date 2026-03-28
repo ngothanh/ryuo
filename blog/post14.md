@@ -812,7 +812,7 @@ Before deploying a Disruptor-based pipeline:
 ```rust
 #[test]
 fn health_check_returns_correct_status() {
-    let ring_buffer = Arc::new(RingBuffer::new(100, || 0u64)); // capacity 128 (next power of 2)
+    let ring_buffer = Arc::new(RingBuffer::new(128, || 0u64)); // capacity 128
     let sequencer = Arc::new(SingleProducerSequencer::new(128, vec![]));
 
     // Simulate: cursor at 100, consumer at 0 → 100/128 = 78% → Warning

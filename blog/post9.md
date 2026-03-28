@@ -263,7 +263,10 @@ impl Sequencer for MultiProducerSequencer {
                 Ok(_) => {
                     // We claimed sequences [current+1, next].
                     // The SequenceClaim will call publish_internal on drop.
-                    return SequenceClaim::new(current + 1, next, /* sequencer ref */);
+                    // Returns a SequenceClaim that publishes via
+                    // available_buffer on drop (see Post 3B for full
+                    // PublishStrategy enum construction).
+                    return SequenceClaim { start: current + 1, end: next, /* ... */ };
                 }
                 Err(_) => {
                     // Another producer advanced the cursor.
@@ -288,7 +291,12 @@ impl Sequencer for MultiProducerSequencer {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => Ok(SequenceClaim::new(current + 1, next, /* sequencer ref */)),
+            Ok(_) => {
+                    // Returns a SequenceClaim that publishes via
+                    // available_buffer on drop (see Post 3B for full
+                    // PublishStrategy enum construction).
+                    Ok(SequenceClaim { start: current + 1, end: next, /* ... */ })
+                }
             Err(_) => Err(InsufficientCapacity), // CAS failed → report as insufficient
         }
     }

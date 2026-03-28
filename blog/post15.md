@@ -371,6 +371,7 @@ impl BenchmarkHarness {
         let mut corrected = Histogram::new_with_bounds(1, 3_600_000_000_000, 3).unwrap();
         let mut raw = Histogram::new_with_bounds(1, 3_600_000_000_000, 3).unwrap();
 
+        let wall_start = std::time::Instant::now();
         for i in 0..self.measurement_iterations {
             let result = benchmark_fn(self.target_rate, self.event_count);
             corrected.add(&result.histogram).unwrap();
@@ -384,9 +385,10 @@ impl BenchmarkHarness {
                 );
             }
         }
+        let wall_clock_ns = wall_start.elapsed().as_nanos() as u64;
 
         // Report
-        self.report_results(name, &corrected, &raw);
+        self.report_results(name, &corrected, &raw, wall_clock_ns);
     }
 
     fn isolate_system(&self) {
@@ -421,6 +423,7 @@ impl BenchmarkHarness {
         name: &str,
         corrected: &Histogram<u64>,
         raw: &Histogram<u64>,
+        wall_clock_ns: u64,
     ) {
         println!("\n=== {} — Aggregate ({} runs × {} events) ===",
             name, self.measurement_iterations, self.event_count);
@@ -436,11 +439,13 @@ impl BenchmarkHarness {
             );
         }
 
-        println!("\n  Throughput: {:.2}M events/sec",
-            self.event_count as f64 * self.measurement_iterations as f64
-                / corrected.mean()
-                / 1_000.0
-        );
+        // Throughput from wall-clock time (not from mean latency —
+        // coordinated omission correction inflates mean, which would
+        // deflate throughput incorrectly).
+        let total_events = self.event_count as u64 * self.measurement_iterations;
+        let throughput_m_per_sec =
+            total_events as f64 / (wall_clock_ns as f64 / 1_000_000_000.0) / 1_000_000.0;
+        println!("\n  Throughput: {:.2}M events/sec", throughput_m_per_sec);
     }
 }
 ```

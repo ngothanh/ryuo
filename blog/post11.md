@@ -67,6 +67,8 @@ Step 2': Register consumer as gating sequence (sequence still -1)
 
 ## Implementation
 
+> **Note on types:** This post uses `Arc<AtomicI64>` in code listings for clarity. In the production implementation (Part 3B), all sequence counters use the cache-padded `Sequence` type (`#[repr(align(128))]`) wrapped in `Arc<Sequence>`. When integrating, replace `Arc<AtomicI64>` with `Arc<Sequence>` and use `Sequence::get()` / `Sequence::set()` instead of direct `load`/`store` calls.
+
 ### Step 1: SequenceGroup
 
 The `SequenceGroup` is the foundation — a thread-safe collection of sequences that supports add/remove at runtime.
@@ -423,7 +425,7 @@ struct MonitoringHandler {
 }
 
 impl EventConsumer<OrderEvent> for MonitoringHandler {
-    fn on_event(&self, event: &OrderEvent, sequence: i64, _end_of_batch: bool) {
+    fn consume(&mut self, event: &OrderEvent, sequence: i64, _end_of_batch: bool) {
         self.event_count += 1;
         println!(
             "[{}] seq={}, order_id={}, count={}",

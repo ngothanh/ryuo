@@ -514,7 +514,7 @@ pub struct SingleProducerSequencer {
 // Cell<i64> already makes it !Sync automatically — the compiler will reject
 // any attempt to share this struct via Arc or similar.
 //
-// Note: Code examples in Posts 4–16 may omit the `wait_strategy` parameter
+// Note: Code examples in Posts 3C–16 may omit the `wait_strategy` parameter
 // for brevity, showing `::new(buffer_size, gating_sequences)`. The full
 // production constructor requires all three parameters as shown here.
 

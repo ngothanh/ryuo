@@ -65,6 +65,8 @@ The `SequenceBarrier` (which we'll build in Part 5) sits between the ring buffer
 
 ## Supporting Types
 
+> **Note on types:** This post uses `Arc<AtomicI64>` in code listings for clarity. In the production implementation (Part 3B), all sequence counters use the cache-padded `Sequence` type (`#[repr(align(128))]`) wrapped in `Arc<Sequence>`. When integrating, replace `Arc<AtomicI64>` with `Arc<Sequence>` and use `Sequence::get()` / `Sequence::set()` instead of direct `load`/`store` calls.
+
 Before we implement the strategies, we need two supporting types that the `WaitStrategy` trait depends on:
 
 ```rust

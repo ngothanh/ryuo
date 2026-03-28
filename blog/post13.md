@@ -263,10 +263,10 @@ impl<T: Send + 'static> DisruptorBuilder<T> {
 
         let sequencer: Arc<dyn Sequencer> = match producer_type {
             ProducerType::Single => {
-                Arc::new(SingleProducerSequencer::new(buffer_size, vec![]))
+                Arc::new(SingleProducerSequencer::new(buffer_size, vec![], Arc::clone(&wait_strategy)))
             }
             ProducerType::Multi => {
-                Arc::new(MultiProducerSequencer::new(buffer_size, vec![]))
+                Arc::new(MultiProducerSequencer::new(buffer_size, vec![], Arc::clone(&wait_strategy)))
             }
         };
 
