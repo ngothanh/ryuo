@@ -880,7 +880,7 @@ In **Part 3B**, we'll use these memory ordering concepts to build actual sequenc
 
 ---
 
-**Next:** [Part 3B — Sequencer Design & Implementation →](post3b.md)
+**Next:** [Part 3B — The Sequencer Trait & SingleProducerSequencer →](post3b.md)
 
 ---
 
