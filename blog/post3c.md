@@ -463,26 +463,163 @@ Same structure as `claim()` but with CAS instead of `fetch_add`. The loop retrie
 
 ---
 
-## Key Takeaways
+## Wiring It Up
 
-1. **Every field change from SingleProducer traces to one cause: multiple writers.** `Cell` becomes `AtomicI64`. A single cursor becomes cursor + available buffer. `!Sync` becomes `Sync`. There are no arbitrary choices — the design follows directly from the concurrency requirements.
+The design is done. Let's see it run. The simplest pipeline: one producer, one consumer.
 
-2. **The cursor changes roles, and that role change forces the biggest design decision.** In single-producer, cursor = published. In multi-producer, cursor = claimed. That single semantic shift is what creates the need for the available buffer, lap counters, and per-slot Release/Acquire pairs. Everything else is a consequence.
+```rust
+use std::sync::Arc;
+use std::thread;
 
-3. **`fetch_add` for `claim()`, CAS for `try_claim()` — and the asymmetry is fundamental.** `fetch_add` always succeeds, so backpressure happens after the cursor advances. CAS can fail, so capacity is checked before the cursor moves. The two operations serve different contracts: "give me a slot, I'll wait" vs "give me a slot or tell me no."
+let ring_buffer = Arc::new(RingBuffer::new(1024));
+let consumer_seq = Arc::new(Sequence::new(-1));
+
+let wait_strategy: Arc<dyn WaitStrategy> = Arc::new(BusySpinWaitStrategy);
+let sequencer = SingleProducerSequencer::new(
+    1024, vec![Arc::clone(&consumer_seq)], Arc::clone(&wait_strategy),
+);
+
+// Clone the cursor BEFORE moving the sequencer to the producer thread.
+// SingleProducerSequencer is !Sync — once moved, you cannot access it.
+let cursor = sequencer.cursor_arc();
+
+let rb_p = Arc::clone(&ring_buffer);
+let rb_c = Arc::clone(&ring_buffer);
+
+let producer = thread::spawn(move || {
+    for i in 0..1000 {
+        let claim = sequencer.claim(1);
+        rb_p.get_mut(claim.start()).value = i;
+    }
+});
+
+let consumer = thread::spawn(move || {
+    let mut next = 0i64;
+    while next < 1000 {
+        while cursor.get() < next { std::hint::spin_loop(); }
+        let _event = rb_c.get(next);
+        consumer_seq.set(next);
+        next += 1;
+    }
+});
+
+producer.join().unwrap();
+consumer.join().unwrap();
+```
+
+With `MultiProducerSequencer`, two things change: the sequencer wraps in `Arc` (it is `Sync`), and consumers must check the available buffer instead of the cursor — because the cursor now means "claimed," not "published." The full consumer-side integration comes in Part 5 with the `SequenceBarrier`.
+
+---
+
+## Does It Survive Concurrency?
+
+The pipeline compiles and runs. But concurrent code that works on your machine can break on a different core count, a different OS scheduler, or under sustained load. We built two sequencers that coordinate threads through atomic operations and memory ordering. A single wrong `Ordering` — `Relaxed` where `Acquire` is needed — would be invisible in a million test runs and catastrophic in production.
+
+[Loom](https://github.com/tokio-rs/loom) replaces the OS scheduler with a deterministic model checker that systematically explores every thread interleaving. If there is a schedule where your code breaks, Loom will find it.
+
+**Can two producers get the same slot?**
+
+```rust
+#[test]
+fn no_duplicate_sequences() {
+    loom::model(|| {
+        let sequencer = Arc::new(MultiProducerSequencer::new(8, vec![]));
+        let claimed = Arc::new(AtomicI64::new(0));
+
+        let handles: Vec<_> = (0..2).map(|_| {
+            let seq = Arc::clone(&sequencer);
+            let claimed = Arc::clone(&claimed);
+            thread::spawn(move || {
+                let claim = seq.claim(1);
+                let bit = 1i64 << (claim.start() as u32);
+                let prev = claimed.fetch_or(bit, Ordering::AcqRel);
+                assert_eq!(prev & bit, 0, "Duplicate sequence!");
+            })
+        }).collect();
+        for h in handles { h.join().unwrap(); }
+    });
+}
+```
+
+**Does Release/Acquire actually work?** This test uses raw `AtomicI64` to test the ordering pattern in isolation.
+
+```rust
+#[test]
+fn publish_happens_before() {
+    loom::model(|| {
+        let data = Arc::new(AtomicI64::new(0));
+        let cursor = Arc::new(AtomicI64::new(-1));
+
+        let (d, c) = (Arc::clone(&data), Arc::clone(&cursor));
+        let producer = thread::spawn(move || {
+            d.store(42, Ordering::Relaxed);
+            c.store(0, Ordering::Release);
+        });
+
+        let (d, c) = (Arc::clone(&data), Arc::clone(&cursor));
+        let consumer = thread::spawn(move || {
+            if c.load(Ordering::Acquire) >= 0 {
+                assert_eq!(d.load(Ordering::Relaxed), 42);
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    });
+}
+```
+
+**Does backpressure prevent overwrites?**
+
+```rust
+#[test]
+fn gating_prevents_overwrite() {
+    loom::model(|| {
+        let consumer_seq = Arc::new(Sequence::new(-1));
+        let sequencer = Arc::new(MultiProducerSequencer::new(
+            2, vec![Arc::clone(&consumer_seq)]
+        ));
+
+        let _claim1 = sequencer.claim(1);
+        let _claim2 = sequencer.claim(1);
+        assert!(sequencer.try_claim(1).is_err(), "Buffer full — must fail");
+
+        consumer_seq.set(0);
+        drop(_claim1);
+        drop(_claim2);
+        assert!(sequencer.try_claim(1).is_ok(), "Consumer advanced — must succeed");
+    });
+}
+```
+
+---
+
+## What Does It Cost?
+
+The single-producer claim is `Cell::get` + `Cell::set` + a cached gating check. About **10ns**. No atomics, no barriers, no cache-line bouncing.
+
+The multi-producer adds `fetch_add` + cache-line bouncing between cores:
+
+| Sequencer | P50 | P50 (4 producers) | P99.9 |
+|-----------|-----|-------------------|-------|
+| SingleProducer | ~10ns | N/A | ~50ns-1us |
+| MultiProducer | ~50ns | ~100-150ns | ~200ns-1us |
+
+Use `SingleProducerSequencer` whenever you can guarantee one writer — it is 5-20x faster. Most systems can be restructured to have a single writer per ring buffer. Reach for multi-producer as a last resort, not a default.
 
 ---
 
 ## Next Up
 
-In **Part 3D**, we will see both sequencers in action with usage examples, Loom concurrency testing, and performance measurements.
+The sequencers handle the producer side. But the consumer is still busy-spinning on the cursor — burning a full core to check a single atomic variable. In Part 4, we will build wait strategies that let consumers trade latency for CPU.
 
-**Next:** [Part 3D — Usage, Testing & Performance -->](post3d.md)
+**Next:** [Part 4 — Wait Strategies: Trading Latency for CPU -->](post4.md)
 
 ---
 
 ## References
 
-- [LMAX Disruptor Technical Paper](https://lmax-exchange.github.io/disruptor/disruptor.html) — Original design rationale
-- [Java Disruptor MultiProducerSequencer.java](https://github.com/LMAX-Exchange/disruptor/blob/master/src/main/java/com/lmax/disruptor/MultiProducerSequencer.java) — Reference implementation
-- Mara Bos, *Rust Atomics and Locks* (O'Reilly, 2023) — Chapters 2-3 on `fetch_add`, CAS, and memory ordering
+- [LMAX Disruptor Technical Paper](https://lmax-exchange.github.io/disruptor/disruptor.html)
+- [Java Disruptor MultiProducerSequencer.java](https://github.com/LMAX-Exchange/disruptor/blob/master/src/main/java/com/lmax/disruptor/MultiProducerSequencer.java)
+- Mara Bos, *Rust Atomics and Locks* (O'Reilly, 2023)
+- [Loom](https://github.com/tokio-rs/loom) — Deterministic concurrency testing

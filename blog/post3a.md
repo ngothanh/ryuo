@@ -488,113 +488,19 @@ t3                                     slot[0].value → 42
 
 ---
 
-### **What Does the CPU Actually Do?**
+### What Does the CPU Actually Do?
 
-Let's see what assembly instructions are generated for each ordering.
+On x86, Release/Acquire are compiler-only fences — x86's Total Store Order already prevents store-store reordering at the hardware level. The cost is zero instructions beyond what `Relaxed` generates. SeqCst requires `XCHG` or `MFENCE` (~20-30 cycles).
 
-**Code:**
-```rust
-// Producer
-slot[0].value = 42;
-ready_flag.store(1, Ordering::???);
-```
+On ARM, Release uses `STLR` (store-release) and Acquire uses `LDAR` (load-acquire) — dedicated instructions with modest cost. SeqCst adds a `DMB ISH` barrier on top.
 
----
+The critical insight for the Disruptor: **Release/Acquire is free on x86 and cheap on ARM. SeqCst is expensive everywhere.** We use SeqCst only for the one place that needs a StoreLoad fence (the single-producer cursor publish before reading consumer positions). Everything else is Release/Acquire.
 
-#### **x86-64 Assembly**
-
-**Relaxed:**
-```asm
-mov    QWORD PTR [rdi], 42      ; Write value to slot[0]
-mov    DWORD PTR [rsi], 1       ; Write 1 to ready_flag (no fence!)
-```
-**Cost:** Free (no fence instruction)
-**⚠️ Warning:** x86 TSO guarantees store-store ordering at the *hardware* level, so the CPU won't reorder these two stores. However, `Relaxed` does **not** prevent the *compiler* from reordering non-atomic operations around these atomic stores. The compiler is free to move `slot[0].value = 42` (a non-atomic write) after the `ready_flag` store, because `Relaxed` imposes no ordering constraints on surrounding memory. This code is **broken even on x86** — you need `Release` to prevent compiler reordering.
-
-**Release:**
-```asm
-mov    QWORD PTR [rdi], 42      ; Write value to slot[0]
-; (compiler barrier — prevents compiler reordering)
-mov    DWORD PTR [rsi], 1       ; Write 1 to ready_flag
-```
-**Cost:** Free on x86 (TSO already provides store-store ordering at the hardware level)
-**Benefit:** Compiler won't reorder; behavior is portable across architectures
-
-**SeqCst:**
-```asm
-mov    QWORD PTR [rdi], 42      ; Write value to slot[0]
-xchg   DWORD PTR [rsi], eax     ; Atomic exchange (implicit full barrier)
-; Alternative: mov + mfence
-; mov    DWORD PTR [rsi], 1
-; mfence                        ; Full memory fence AFTER store
-```
-**Cost:** ~20-30 cycles (XCHG has implicit LOCK prefix, or MFENCE instruction)
-**When needed:** StoreLoad fence (publish cursor, then read consumer positions)
-
----
-
-#### **ARM64 (AArch64) Assembly**
-
-**Relaxed:**
-```asm
-str    x0, [x1]                 ; Write value to slot[0]
-str    w2, [x3]                 ; Write 1 to ready_flag (no barrier!)
-```
-**Cost:** Free (no barrier instruction)
-**Problem:** ARM can aggressively reorder these stores!
-
-**Release:**
-```asm
-str    x0, [x1]                 ; Write value to slot[0]
-stlr   w2, [x3]                 ; Store-release: ready_flag
-```
-**Cost:** Modest (STLR instruction has ordering constraints built in)
-**Note:** ARMv8+ uses dedicated `STLR` (store-release) and `LDAR` (load-acquire) instructions rather than separate barriers. These are more efficient than the older ARMv7 approach of `STR` + `DMB`.
-
-**SeqCst:**
-```asm
-str    x0, [x1]                 ; Write value to slot[0]
-stlr   w2, [x3]                 ; Store-release: ready_flag
-dmb    ish                      ; Full barrier for StoreLoad ordering
-```
-**Cost:** Higher (STLR + DMB barrier)
-**Note:** The additional `DMB ISH` provides the StoreLoad fence that SeqCst requires beyond Release semantics. Exact instruction sequences vary by compiler and context.
-
----
-
-**Key insights:**
-1. **x86 is cheap** — Total Store Order (TSO) provides store-store ordering for free at the hardware level. Release is a compiler-only fence on x86.
-2. **ARM requires explicit instructions** — Weak memory model requires `STLR`/`LDAR` or barrier instructions
-3. **SeqCst is always more expensive** — Full fence on all architectures
-4. **Release/Acquire is the sweet spot** — Sufficient for most use cases, cheapest correct option
-
-**Source:** Compiler Explorer (godbolt.org), Intel/ARM architecture manuals
-
----
-
-### **Performance Summary**
-
-| Ordering | Cost (x86) | Cost (ARM) | What It Does |
-|----------|------------|------------|--------------|
-| **Relaxed** | Free | Free | Atomic operation only, no ordering |
-| **Acquire** | Free (compiler barrier) | Modest (LDAR) | Prevents reordering of subsequent reads |
-| **Release** | Free (compiler barrier) | Modest (STLR) | Prevents reordering of prior writes |
-| **AcqRel** | Free (compiler barrier) | Modest (STLR/LDAR) | Both Acquire + Release |
-| **SeqCst** | ~20-30 cycles (XCHG/MFENCE) | Higher (STLR + DMB) | Full barrier (includes StoreLoad fence) |
-
-**Architecture-specific notes:**
-
-**x86-64 (Total Store Order):**
-- Acquire/Release are compiler-only fences (TSO provides hardware ordering)
-- SeqCst requires MFENCE or XCHG (~20-30 cycles)
-- Most production HFT systems have historically run on x86 (though ARM adoption is growing)
-
-**ARM/PowerPC (Weak Memory Models):**
-- Acquire/Release use dedicated instructions (LDAR/STLR on ARMv8+)
-- SeqCst requires additional barrier (DMB)
-- **Important:** Always test on target architecture!
-
-**Source:** "Rust Atomics and Locks" (Mara Bos), Intel/ARM architecture manuals
+| Ordering | Cost (x86) | Cost (ARM) |
+|----------|------------|------------|
+| Relaxed | Free | Free |
+| Release/Acquire | Free (compiler barrier) | Modest (STLR/LDAR) |
+| SeqCst | ~20-30 cycles (XCHG/MFENCE) | Higher (STLR + DMB) |
 
 ---
 
@@ -676,61 +582,6 @@ START: I need to use an atomic operation
 | **Wait for ready (read)** | Yes | Yes (data after) | **Acquire** | `ready.load(Acquire)` |
 | **Multi-producer claim** | Yes | Yes (both) | **AcqRel** | `cursor.fetch_add(1, AcqRel)` |
 | **Publish then check** | Yes | Yes + StoreLoad | **SeqCst** | `cursor.store(n, SeqCst)` |
-
----
-
-### **The "Aha!" Moment Test**
-
-After reading this section, you should be able to answer this question:
-
-**Scenario:** You're implementing a work-stealing queue. Thread A pushes work, Thread B steals it.
-
-```rust
-// Thread A (Producer)
-queue[tail] = work_item;
-tail.store(new_tail, Ordering::???);  // What ordering?
-
-// Thread B (Consumer)
-let t = tail.load(Ordering::???);     // What ordering?
-let work = queue[t];
-```
-
-**Think about it before scrolling...**
-
-<details>
-<summary>Click to reveal answer</summary>
-
-**Answer:**
-```rust
-// Thread A (Producer)
-queue[tail] = work_item;
-tail.store(new_tail, Ordering::Release);  // ← Release
-
-// Thread B (Consumer)
-let t = tail.load(Ordering::Acquire);     // ← Acquire
-let work = queue[t];
-```
-
-**Why?**
-1. **Producer writes data, then signals** → Classic Release pattern
-   - `work_item` must be visible before `tail` update
-   - Release ensures all prior writes are visible
-
-2. **Consumer waits for signal, then reads data** → Classic Acquire pattern
-   - Wait for `tail` update (Acquire)
-   - Then read `work_item` (guaranteed to see it)
-
-3. **This is Pattern 1** (flag-based synchronization) — see below!
-
-**Decision tree path:**
-- Q2: Synchronizes? YES (work_item depends on tail)
-- Q3: Writing or reading? WRITING (tail.store)
-- Q4: Other data visible first? YES (work_item)
-- → Use Release
-
-If you got this right, you understand memory ordering!
-
-</details>
 
 ---
 
@@ -816,18 +667,6 @@ let min_consumer = get_minimum_consumer();
 | "Publish cursor, then check consumers" | Pattern 4 (StoreLoad) | SeqCst |
 
 **Key insight:** 90% of problems are Pattern 1 or Pattern 2!
-
----
-
-### **Confidence Check**
-
-You should now be able to:
-
-1. **Visualize** what happens conceptually for each ordering
-2. **Recognize** which pattern your problem matches
-3. **Choose** the right ordering using the decision flowchart
-4. **Explain** why you chose that ordering (not just cargo-culting)
-5. **Distinguish** between compiler reordering and CPU reordering
 
 ---
 

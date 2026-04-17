@@ -9,7 +9,12 @@
 
 ## Recap
 
-In Part 3A, we established the three memory ordering patterns that govern concurrent code: Release/Acquire for happens-before relationships, SeqCst for StoreLoad fences, and Relaxed for single-writer paths. We saw that 90% of synchronization boils down to flag-based (Pattern 1) or counter-based (Pattern 2) coordination. Now we build the component that puts those orderings to work — the sequencer, the traffic cop that coordinates all access to the ring buffer.
+In Part 3A, we learned three things:
+- **Release/Acquire** creates happens-before relationships between producer and consumer
+- **SeqCst** adds a StoreLoad fence — expensive, rarely needed
+- **Relaxed** is safe only when no other data depends on the atomic
+
+Now we build the component that puts those orderings to work.
 
 ---
 
